@@ -2,13 +2,14 @@
 
 A C++20 HTTP API gateway, built up in stages.
 
-**Current stage: 2 — routing.**
+**Current stage: 3 — reverse proxying.**
 
 The gateway starts an HTTP listener, answers `GET /health` itself, and resolves
 every other request against a route table that maps a method and path prefix to
-a logical service name. Matched requests get a response naming the selected
-service; nothing is forwarded anywhere. Proxying, load balancing, rate limiting
-and the rest of the eventual feature set are not implemented yet.
+a logical service name. A matched request is forwarded to that service's
+configured backend, and the backend's response is returned to the client. Load
+balancing, health checking, retries, rate limiting and the rest of the eventual
+feature set are not implemented yet.
 
 ## Requirements
 
@@ -49,10 +50,15 @@ To build without tests, configure with `-DAPI_GATEWAY_BUILD_TESTS=OFF`.
 Settings are resolved lowest-to-highest precedence: built-in defaults,
 environment variables, then command-line flags.
 
-| Setting | Default   | Environment    | Flag             |
-| ------- | --------- | -------------- | ---------------- |
-| Host    | `0.0.0.0` | `GATEWAY_HOST` | `--host <addr>`  |
-| Port    | `8080`    | `GATEWAY_PORT` | `--port <1-65535>` |
+| Setting         | Default              | Environment                   | Flag                          |
+| --------------- | -------------------- | ----------------------------- | ----------------------------- |
+| Host            | `0.0.0.0`            | `GATEWAY_HOST`                | `--host <addr>`               |
+| Port            | `8080`               | `GATEWAY_PORT`                | `--port <1-65535>`            |
+| Backends        | built-in table       | `GATEWAY_BACKENDS`            | `--backend <svc>=<host>:<port>` |
+| Backend timeout | `5000` ms            | `GATEWAY_BACKEND_TIMEOUT_MS`  | `--backend-timeout-ms <ms>`   |
+
+`--backend` may be repeated; `GATEWAY_BACKENDS` takes a comma-separated list of
+the same `service=host:port` form. A leading `http://` is accepted and ignored.
 
 `config/gateway.env` holds the defaults in a form that a shell can source.
 
@@ -75,15 +81,15 @@ Content-Type: application/json
 
 ### A path covered by a route
 
-Stage 2 does not forward anything, so a matched request reports which service
-the router selected and why.
+The request is forwarded to the service's backend, and the backend's status,
+body and headers come back unchanged.
 
 ```
 $ curl http://localhost:8080/users/123
 200 OK
 Content-Type: application/json
 
-{"status":"routed","service":"users","matched_prefix":"/users","method":"GET","path":"/users/123"}
+<whatever the users backend returned for GET /users/123>
 ```
 
 ### A path covered by a route, with a method it does not accept
@@ -103,6 +109,27 @@ Allow: GET
 Content-Type: application/json
 
 {"status":"error","error":"not_found"}
+```
+
+### The gateway could not reach the backend
+
+```
+502 Bad Gateway
+Content-Type: application/json
+
+{"status":"error","error":"bad_gateway","reason":"backend_unreachable","service":"users"}
+```
+
+`reason` is `no_backend_configured` when the matched service has no entry in the
+backend table, and `backend_unreachable` when the connection failed.
+
+### The backend did not answer in time
+
+```
+504 Gateway Timeout
+Content-Type: application/json
+
+{"status":"error","error":"gateway_timeout","reason":"backend_timeout","service":"users"}
 ```
 
 ## Routing
@@ -140,6 +167,37 @@ when only the shorter one has the requested method: with `GET /api` and
 `POST /api/admin` registered, `GET /api/admin/users` is a `405`, not a match on
 `api`. This keeps the outcome a function of the path alone.
 
+## Proxying
+
+Routing decides *which* service a request belongs to; the backend table decides
+*where* that service is. The built-in table is:
+
+| Service    | Backend                 |
+| ---------- | ----------------------- |
+| `users`    | `127.0.0.1:9001`        |
+| `orders`   | `127.0.0.1:9002`        |
+| `products` | `127.0.0.1:9003`        |
+
+Override it with `--backend` or `GATEWAY_BACKENDS` (see Configuration). The
+first backend supplied from any source replaces the built-in table; later ones
+add a service or override one.
+
+A matched request is forwarded with its method, its original request target
+(path and query unchanged — there is no path rewriting), its body and its
+headers. Hop-by-hop headers (`Connection`, `Keep-Alive`, `Proxy-Authenticate`,
+`Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`) are
+dropped in both directions, and `Host` and `Content-Length` are regenerated for
+the backend. The backend's status, body and remaining headers are returned to
+the client as-is, so a backend `201` or `404` reaches the client as `201` or
+`404` rather than becoming a gateway error.
+
+Only services present in the backend table are ever contacted. The destination
+is never taken from the request, so the gateway cannot be used as an open proxy.
+
+Outbound requests use a finite connect/read/write timeout, **5000 ms** by
+default (`--backend-timeout-ms`). A refused connection is a `502`; exceeding the
+timeout is a `504`.
+
 ## Layout
 
 ```
@@ -151,13 +209,20 @@ src/                    Implementation; main.cpp is the entry point only
 tests/                  GoogleTest suite
 ```
 
-`src/config.cpp`, `src/router.cpp` and `src/server.cpp` build into the
-`api_gateway_core` library, which both the executable and the tests link
-against — the tests therefore run the same server code that ships.
+`src/config.cpp`, `src/proxy.cpp`, `src/router.cpp` and `src/server.cpp` build
+into the `api_gateway_core` library, which both the executable and the tests
+link against — the tests therefore run the same server code that ships.
 
-`Router` holds all route matching and knows nothing about cpp-httplib, so it is
-unit tested without opening a socket. `GatewayServer` asks it for a decision and
-turns that decision into an HTTP response.
+Responsibilities are split so each answers one question:
+
+- `Router` — which logical service does this request belong to? Knows nothing
+  about cpp-httplib, so it is unit tested without opening a socket.
+- `ServerConfig` — where is that service, and how long may it take?
+- `ReverseProxy` — how do I forward this request and return the response?
+- `GatewayServer` — coordinates the HTTP lifecycle across the three.
+
+The proxy tests start a real backend server in-process and assert on what it
+received, so they exercise the whole client → gateway → backend → client path.
 
 ## Dependencies
 

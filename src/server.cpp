@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "gateway/proxy.hpp"
 #include "gateway/router.hpp"
 
 namespace gateway {
@@ -19,6 +20,10 @@ constexpr const char* kJsonContentType = "application/json";
 // Owned by the gateway itself: never offered to the Router, so no route table
 // can shadow or take over the health endpoint.
 constexpr const char* kHealthPath = "/health";
+
+// Matched by httplib as a regex, so it covers every path. Registered after the
+// gateway's own endpoints, which therefore win.
+constexpr const char* kCatchAllPattern = ".*";
 
 // These payloads are fixed, so they are stored as literals rather than
 // assembled at runtime. The gateway has no JSON dependency.
@@ -53,19 +58,20 @@ void append_json_string(std::string& out, std::string_view value) {
     out += '"';
 }
 
-/// Body for a request the Router attributed to a service. Stage 2 forwards
-/// nothing, so the response simply reports which service was selected and why.
-std::string routed_body(const Route& route, const httplib::Request& request) {
-    std::string body = R"({"status":"routed","service":)";
-    append_json_string(body, route.service);
-    body += R"(,"matched_prefix":)";
-    append_json_string(body, route.path_prefix);
-    body += R"(,"method":)";
-    append_json_string(body, request.method);
-    body += R"(,"path":)";
-    append_json_string(body, request.path);
+/// Reports an error the gateway itself produced while proxying.
+void respond_gateway_error(httplib::Response& response, int status, std::string_view error,
+                           std::string_view reason, std::string_view service) {
+    std::string body = R"({"status":"error","error":)";
+    append_json_string(body, error);
+    body += R"(,"reason":)";
+    append_json_string(body, reason);
+    body += R"(,"service":)";
+    append_json_string(body, service);
     body += '}';
-    return body;
+
+    response.status = status;
+    response.set_content(body, kJsonContentType);
+    std::cerr << "gateway: " << reason << " for service '" << service << "'\n";
 }
 
 std::string method_not_allowed_body(const std::vector<std::string_view>& allowed_methods) {
@@ -100,6 +106,7 @@ GatewayServer::GatewayServer(ServerConfig config)
 GatewayServer::GatewayServer(ServerConfig config, Router router)
     : config_(std::move(config)),
       router_(std::move(router)),
+      proxy_(config_.backends, config_.backend_timeout),
       http_(std::make_unique<httplib::Server>()) {
     register_routes();
 }
@@ -111,10 +118,26 @@ void GatewayServer::handle_service_request(const httplib::Request& request,
     const RouteMatch match = router_.match(request.method, request.path);
 
     switch (match.status) {
-        case MatchStatus::kMatched:
-            response.status = httplib::StatusCode::OK_200;
-            response.set_content(routed_body(*match.route, request), kJsonContentType);
+        case MatchStatus::kMatched: {
+            const std::string& service = match.route->service;
+            switch (proxy_.forward(service, request, response)) {
+                case ProxyStatus::kForwarded:
+                    return;
+                case ProxyStatus::kUnknownService:
+                    respond_gateway_error(response, httplib::StatusCode::BadGateway_502,
+                                          "bad_gateway", "no_backend_configured", service);
+                    return;
+                case ProxyStatus::kBackendUnreachable:
+                    respond_gateway_error(response, httplib::StatusCode::BadGateway_502,
+                                          "bad_gateway", "backend_unreachable", service);
+                    return;
+                case ProxyStatus::kBackendTimeout:
+                    respond_gateway_error(response, httplib::StatusCode::GatewayTimeout_504,
+                                          "gateway_timeout", "backend_timeout", service);
+                    return;
+            }
             return;
+        }
 
         case MatchStatus::kMethodNotAllowed:
             response.status = httplib::StatusCode::MethodNotAllowed_405;
@@ -124,9 +147,8 @@ void GatewayServer::handle_service_request(const httplib::Request& request,
             return;
 
         case MatchStatus::kNotFound:
-            // Leave the body empty; the shared error handler below writes the
-            // gateway's standard 404 payload, so there is one source of truth.
             response.status = httplib::StatusCode::NotFound_404;
+            response.set_content(kNotFoundBody, kJsonContentType);
             return;
     }
 }
@@ -136,21 +158,29 @@ void GatewayServer::register_routes() {
         response.set_content(kHealthyBody, kJsonContentType);
     });
 
-    // Every path except the gateway's own endpoints is resolved by the Router.
-    // Running before httplib's own dispatch keeps route matching in one place.
-    http_->set_pre_routing_handler(
-        [this](const httplib::Request& request, httplib::Response& response) {
-            if (request.path == kHealthPath) {
-                return httplib::Server::HandlerResponse::Unhandled;
-            }
-            handle_service_request(request, response);
-            return httplib::Server::HandlerResponse::Handled;
-        });
+    // Per-method catch-alls rather than a pre-routing handler: httplib reads the
+    // request body only after routing, and the proxy needs it.
+    const auto handler = [this](const httplib::Request& request, httplib::Response& response) {
+        if (request.path == kHealthPath) {
+            // Gateway-owned. GET is served above; no other method is offered to
+            // the router, so /health can never reach a backend.
+            response.status = httplib::StatusCode::NotFound_404;
+            response.set_content(kNotFoundBody, kJsonContentType);
+            return;
+        }
+        handle_service_request(request, response);
+    };
+    http_->Get(kCatchAllPattern, handler);
+    http_->Post(kCatchAllPattern, handler);
+    http_->Put(kCatchAllPattern, handler);
+    http_->Patch(kCatchAllPattern, handler);
+    http_->Delete(kCatchAllPattern, handler);
+    http_->Options(kCatchAllPattern, handler);
 
-    // Anything the gateway does not know about, including unmatched methods on
-    // its own endpoints.
+    // Safety net for statuses httplib produces on its own. Proxied responses
+    // carry their backend's body and are left alone.
     http_->set_error_handler([](const httplib::Request&, httplib::Response& response) {
-        if (response.status == httplib::StatusCode::NotFound_404) {
+        if (response.status == httplib::StatusCode::NotFound_404 && response.body.empty()) {
             response.set_content(kNotFoundBody, kJsonContentType);
         }
     });
@@ -202,6 +232,11 @@ bool GatewayServer::run() {
         std::cout << "gateway: route " << route.method << ' ' << route.path_prefix << " -> "
                   << route.service << '\n';
     }
+    for (const auto& [service, backend] : proxy_.backends()) {
+        std::cout << "gateway: backend " << service << " -> " << backend.host << ':'
+                  << backend.port << '\n';
+    }
+    std::cout << "gateway: backend timeout " << proxy_.timeout().count() << "ms\n";
     // std::endl: flush so the readiness line appears immediately even when
     // stdout is redirected to a file or pipe.
     std::cout << "gateway: listening on " << config_.host << ':' << bound_port_ << std::endl;

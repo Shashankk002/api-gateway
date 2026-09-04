@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "gateway/config.hpp"
+#include "gateway/proxy.hpp"
 #include "gateway/router.hpp"
 
 namespace httplib {
@@ -17,13 +18,14 @@ namespace gateway {
 /// The gateway's HTTP front door.
 ///
 /// It answers `GET /health` itself and delegates every other path to a Router,
-/// which decides whether the request is routed to a logical service, is
-/// method-not-allowed, or is unknown. The server then turns that decision into
-/// an HTTP response; it holds no route-matching logic of its own.
+/// which decides whether the request belongs to a logical service, is
+/// method-not-allowed, or is unknown. A matched request is then handed to the
+/// ReverseProxy, which forwards it to that service's configured backend. The
+/// server holds neither route-matching nor forwarding logic of its own.
 ///
-/// The type owns its httplib::Server and its Router, so handler state lives on
-/// the instance instead of in globals, which lets tests run servers side by
-/// side on their own ports with their own route tables.
+/// The type owns its httplib::Server, Router and ReverseProxy, so handler state
+/// lives on the instance instead of in globals, which lets tests run servers
+/// side by side on their own ports, route tables and backends.
 ///
 /// Binding and serving are separate steps so that a caller (notably a test) can
 /// learn the port before the blocking serve loop starts.
@@ -32,8 +34,9 @@ public:
     /// Serves the gateway's built-in service route table.
     explicit GatewayServer(ServerConfig config);
 
-    /// Serves an explicit route table. Used by tests today, and the seam
-    /// through which configured routes will arrive later.
+    /// Serves an explicit route table. Backends and the backend timeout come
+    /// from `config`. Used by tests today, and the seam through which
+    /// configured routes will arrive later.
     GatewayServer(ServerConfig config, Router router);
 
     ~GatewayServer();
@@ -63,15 +66,18 @@ public:
 
     [[nodiscard]] const ServerConfig& config() const noexcept { return config_; }
     [[nodiscard]] const Router& router() const noexcept { return router_; }
+    [[nodiscard]] const ReverseProxy& proxy() const noexcept { return proxy_; }
 
 private:
     void register_routes();
 
-    /// Turns the Router's decision for `request` into a response.
+    /// Turns the Router's decision for `request` into a response, proxying to
+    /// the selected service's backend when the request matches a route.
     void handle_service_request(const httplib::Request& request, httplib::Response& response) const;
 
     ServerConfig config_;
     Router router_;
+    ReverseProxy proxy_;
     std::unique_ptr<httplib::Server> http_;
     std::uint16_t bound_port_{0};
 };

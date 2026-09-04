@@ -3,6 +3,7 @@ include(GoogleTest)
 add_executable(api_gateway_tests
     config_test.cpp
     health_endpoint_test.cpp
+    proxy_integration_test.cpp
     router_test.cpp
     routing_integration_test.cpp)
 
