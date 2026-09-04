@@ -267,8 +267,10 @@ TEST_F(NoInstancesTest, GatewayKeepsServingHealth) {
     EXPECT_EQ(response->status, 200);
 }
 
-/// One live instance alongside one whose port nothing is listening on. Stage 4
-/// does no failover, so a request selecting the dead instance must still fail.
+/// One live instance alongside one whose port nothing is listening on. Retries
+/// are switched off here so this keeps testing what it was written for: neither
+/// the balancer nor the proxy fails over on its own. Retry-driven recovery is
+/// covered in the reliability tests.
 class PartiallyDeadPoolTest : public gateway_test::GatewayServerTestBase {
 protected:
     Router make_router() override { return users_router(); }
@@ -276,6 +278,7 @@ protected:
     gateway::ServerConfig make_config() override {
         auto config = loopback_config();
         config.backends = {{"users", {live_.endpoint(), closed_endpoint_}}};
+        config.max_retries = 0;
         return config;
     }
 
@@ -295,7 +298,7 @@ TEST_F(PartiallyDeadPoolTest, SelectingAnUnreachableInstanceStillReturns502) {
 
     const auto second = client.Get("/users");
     ASSERT_TRUE(second);
-    EXPECT_EQ(second->status, 502) << "no failover in this stage";
+    EXPECT_EQ(second->status, 502) << "no failover without a retry budget";
     EXPECT_TRUE(contains(second->body, R"("reason":"backend_unreachable")")) << second->body;
 
     // Rotation continues past the failure rather than sticking.
@@ -306,6 +309,7 @@ TEST_F(PartiallyDeadPoolTest, SelectingAnUnreachableInstanceStillReturns502) {
 }
 
 /// A pool whose selected instance answers far later than the gateway will wait.
+/// Retries are switched off so the timeout itself is what the test observes.
 class SlowInstanceTest : public gateway_test::GatewayServerTestBase {
 protected:
     Router make_router() override { return users_router(); }
@@ -314,6 +318,7 @@ protected:
         auto config = loopback_config();
         config.backends = {{"users", {fast_.endpoint(), slow_.endpoint()}}};
         config.backend_timeout = std::chrono::milliseconds{200};
+        config.max_retries = 0;
         return config;
     }
 

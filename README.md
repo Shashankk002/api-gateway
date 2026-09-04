@@ -2,15 +2,17 @@
 
 A C++20 HTTP API gateway, built up in stages.
 
-**Current stage: 5 — backend health checks.**
+**Current stage: 6 — timeouts, bounded retries and circuit breakers.**
 
 The gateway starts an HTTP listener, answers `GET /health` itself, and resolves
 every other request against a route table that maps a method and path prefix to
 a logical service name. A service may have several backend instances, which are
 probed in the background; one of the currently healthy ones is picked
 round-robin and the request is forwarded to it, with the backend's response
-returned to the client. Failover, retries, rate limiting and the rest of the
-eventual feature set are not implemented yet.
+returned to the client. A transient failure on a safe method is retried once
+onto another instance, and an instance that keeps failing has its circuit opened
+so it stops receiving traffic until it recovers. Rate limiting and the rest of
+the eventual feature set are not implemented yet.
 
 ## Requirements
 
@@ -58,6 +60,9 @@ environment variables, then command-line flags.
 | Backends        | built-in table       | `GATEWAY_BACKENDS`            | `--backend <svc>=<host>:<port>` |
 | Backend timeout | `5000` ms            | `GATEWAY_BACKEND_TIMEOUT_MS`  | `--backend-timeout-ms <ms>`   |
 | Health interval | `5000` ms            | `GATEWAY_HEALTH_CHECK_INTERVAL_MS` | `--health-check-interval-ms <ms>` |
+| Max retries     | `1`                  | `GATEWAY_MAX_RETRIES`         | `--max-retries <0-10>`        |
+| Circuit threshold | `5`                | `GATEWAY_CIRCUIT_FAILURE_THRESHOLD` | `--circuit-failure-threshold <1-1000>` |
+| Circuit cooldown | `5000` ms           | `GATEWAY_CIRCUIT_COOLDOWN_MS` | `--circuit-cooldown-ms <0-3600000>` |
 
 `--backend` may be repeated; `GATEWAY_BACKENDS` takes a comma-separated list of
 the same `service=host:port` form. A leading `http://` is accepted and ignored.
@@ -73,6 +78,8 @@ GATEWAY_BACKENDS=users=127.0.0.1:9001,users=127.0.0.1:9002 api-gateway
 
 The health-check interval accepts `0` to turn health checking off entirely,
 leaving every configured instance eligible; otherwise it is 1–3600000 ms.
+`--max-retries 0` disables retries, and `--circuit-cooldown-ms 0` lets an open
+circuit probe on the very next request.
 
 `config/gateway.env` holds the defaults in a form that a shell can source.
 
@@ -259,10 +266,63 @@ gateway: backend users 127.0.0.1:9002 is healthy
 ```
 
 **Limitations at this stage.** Health state is only as fresh as the last sweep,
-so an instance that dies between probes is still selected and that request gets
-the usual `502` — the gateway does not retry elsewhere, and a proxy failure does
-not itself change health state. There is no failover, no circuit breaker, no
-backoff, and no weighting or session affinity.
+so an instance that dies between probes is still selected; a retry can recover
+that request when the method is safe and another instance is eligible. A proxy
+failure does not change health state — it feeds the circuit breaker instead.
+There is no backoff, no weighting and no session affinity.
+
+## Reliability
+
+Every outbound request uses the backend timeout for connect, read and write. A
+timeout that no retry rescues is still a `504`, and an unreachable backend is
+still a `502`.
+
+### Retry policy
+
+A failed attempt is retried only when **both** of these hold:
+
+- **The method is safe to repeat** — `GET`, `HEAD` or `OPTIONS`. `POST`, `PUT`,
+  `PATCH` and `DELETE` are never replayed. A connection failure probably means
+  the backend never saw the request, but the gateway cannot tell that apart from
+  a failure after the backend already acted, so it does not guess.
+- **The failure is transient** — the backend was unreachable, it timed out, or
+  it answered `502`, `503` or `504`. Any other status, including `4xx` and a
+  plain `500`, is the backend's answer and is passed straight through.
+
+Retries are bounded by `--max-retries` (default `1`, so two attempts at most)
+and each attempt goes to a *different* instance: an instance already tried in
+this request is never tried again, so a single-instance service is never
+retried. Circuit state is respected — a retry never lands on a circuit that is
+refusing traffic. The request target, headers and body are re-sent unchanged on
+each attempt, and a failed attempt contributes nothing to the final response.
+
+When every attempt fails, the client gets the transport error (`502` or `504`)
+or, if the last backend actually answered with `502`/`503`/`504`, that response
+itself, which carries more information than a synthesised error would.
+
+### Circuit breakers
+
+Each backend instance has its own breaker, keyed to its position in the
+service's configured list so state stays tied to the right endpoint.
+
+| State | Behaviour |
+| --- | --- |
+| `CLOSED` | Normal traffic. Consecutive transient failures are counted; reaching the threshold opens the circuit. Any success resets the count. |
+| `OPEN` | No traffic reaches the instance. After the cooldown it admits one probe. |
+| `HALF_OPEN` | Exactly one probe is in flight. Success closes the circuit and clears the count; failure reopens it and restarts the cooldown. |
+
+The same predicate that decides "retryable" decides "counts as a circuit
+failure", so the two can never disagree: transport failures and `502`/`503`/`504`
+count, and successes and ordinary `4xx`/`5xx` answers do not.
+
+The load balancer skips an instance whose circuit is open and still cooling
+down. A circuit past its cooldown stays selectable, which is how the probe gets
+through. When no instance can be reached because every circuit is refusing
+traffic, the gateway answers `503` with reason `circuit_open`.
+
+Circuit state and health state are independent. Health reflects what background
+probing observed; a circuit reflects how real requests have been failing.
+Neither resets the other.
 
 Outbound requests use a finite connect/read/write timeout, **5000 ms** by
 default (`--backend-timeout-ms`). A refused connection is a `502`; exceeding the
@@ -279,8 +339,9 @@ src/                    Implementation; main.cpp is the entry point only
 tests/                  GoogleTest suite
 ```
 
-`src/config.cpp`, `src/health.cpp`, `src/load_balancer.cpp`, `src/proxy.cpp`,
-`src/router.cpp` and `src/server.cpp` build into the `api_gateway_core` library, which both the
+`src/circuit_breaker.cpp`, `src/config.cpp`, `src/health.cpp`,
+`src/load_balancer.cpp`, `src/proxy.cpp`, `src/router.cpp` and `src/server.cpp`
+build into the `api_gateway_core` library, which both the
 executable and the tests link against — the tests therefore run the same server
 code that ships.
 
@@ -291,13 +352,16 @@ Responsibilities are split so each answers one question:
 - `ServerConfig` — where are that service's instances, and how long may they take?
 - `BackendHealth` / `HealthChecker` — is this instance currently healthy? The
   only component that probes backends, on its own thread.
-- `LoadBalancer` — which healthy instance serves this request? Does no I/O and
-  never probes; it only reads health state.
+- `CircuitBreaker` — should this instance be given traffic right now, given how
+  its recent requests went? Holds no network code.
+- `LoadBalancer` — which eligible instance serves this request? Does no I/O and
+  never probes; it only reads health and circuit state.
 - `ReverseProxy` — how do I forward this request to a given instance and return
-  the response? Never chooses among instances.
-- `GatewayServer` — coordinates the HTTP lifecycle across the rest, and owns the
-  health checker's lifetime: it starts on construction and is stopped and joined
-  by `stop()` and by the destructor.
+  the response? Never chooses among instances and never retries.
+- `GatewayServer` — coordinates the HTTP lifecycle across the rest: it sequences
+  select → circuit check → forward → record outcome → maybe retry, and owns the
+  health checker's lifetime (started on construction, stopped and joined by
+  `stop()` and by the destructor).
 
 The proxy tests start a real backend server in-process and assert on what it
 received, so they exercise the whole client → gateway → backend → client path.

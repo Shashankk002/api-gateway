@@ -12,6 +12,12 @@
 namespace gateway {
 namespace {
 
+// Bounds keep a misconfiguration from turning into a huge retry budget, an
+// unreachable circuit threshold, or a cooldown that never expires.
+constexpr unsigned long kMaxRetriesLimit = 10;
+constexpr unsigned long kMaxFailureThreshold = 1000;
+constexpr unsigned long kMaxCooldownMs = 3600000;
+
 std::uint16_t parse_port(std::string_view text, std::string_view source) {
     unsigned long value = 0;
     const auto* begin = text.data();
@@ -43,6 +49,21 @@ std::chrono::milliseconds parse_timeout_ms(std::string_view text, std::string_vi
                                     std::string(text) + "'");
     }
     return std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(value));
+}
+
+/// Parses a non-negative integer within [min, max].
+unsigned long parse_bounded(std::string_view text, std::string_view source, unsigned long min,
+                            unsigned long max) {
+    unsigned long value = 0;
+    const auto* end = text.data() + text.size();
+    const auto result = std::from_chars(text.data(), end, value);
+    if (text.empty() || result.ec != std::errc{} || result.ptr != end || value < min ||
+        value > max) {
+        throw std::invalid_argument(std::string(source) + ": expected a value in " +
+                                    std::to_string(min) + "-" + std::to_string(max) + ", got '" +
+                                    std::string(text) + "'");
+    }
+    return value;
 }
 
 /// Health-check interval: 0 disables checking, otherwise up to an hour. The
@@ -140,6 +161,18 @@ ServerConfig load_config(int argc, const char* const* argv) {
         config.health_check_interval =
             parse_interval_ms(interval, "GATEWAY_HEALTH_CHECK_INTERVAL_MS");
     }
+    if (const char* retries = non_empty_env("GATEWAY_MAX_RETRIES")) {
+        config.max_retries = static_cast<unsigned>(
+            parse_bounded(retries, "GATEWAY_MAX_RETRIES", 0, kMaxRetriesLimit));
+    }
+    if (const char* threshold = non_empty_env("GATEWAY_CIRCUIT_FAILURE_THRESHOLD")) {
+        config.circuit_failure_threshold = static_cast<unsigned>(parse_bounded(
+            threshold, "GATEWAY_CIRCUIT_FAILURE_THRESHOLD", 1, kMaxFailureThreshold));
+    }
+    if (const char* cooldown = non_empty_env("GATEWAY_CIRCUIT_COOLDOWN_MS")) {
+        config.circuit_cooldown = std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(
+            parse_bounded(cooldown, "GATEWAY_CIRCUIT_COOLDOWN_MS", 0, kMaxCooldownMs)));
+    }
     if (const char* backends = non_empty_env("GATEWAY_BACKENDS")) {
         std::string_view remaining = backends;
         while (!remaining.empty()) {
@@ -165,6 +198,16 @@ ServerConfig load_config(int argc, const char* const* argv) {
         } else if (arg == "--health-check-interval-ms") {
             config.health_check_interval =
                 parse_interval_ms(require_value(argc, argv, ++i, arg), arg);
+        } else if (arg == "--max-retries") {
+            config.max_retries = static_cast<unsigned>(
+                parse_bounded(require_value(argc, argv, ++i, arg), arg, 0, kMaxRetriesLimit));
+        } else if (arg == "--circuit-failure-threshold") {
+            config.circuit_failure_threshold = static_cast<unsigned>(
+                parse_bounded(require_value(argc, argv, ++i, arg), arg, 1, kMaxFailureThreshold));
+        } else if (arg == "--circuit-cooldown-ms") {
+            config.circuit_cooldown =
+                std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(
+                    parse_bounded(require_value(argc, argv, ++i, arg), arg, 0, kMaxCooldownMs)));
         } else {
             throw std::invalid_argument("unknown argument '" + std::string(arg) + "'");
         }

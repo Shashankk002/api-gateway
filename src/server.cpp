@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "gateway/circuit_breaker.hpp"
 #include "gateway/health.hpp"
 #include "gateway/load_balancer.hpp"
 #include "gateway/proxy.hpp"
@@ -88,6 +89,34 @@ std::string method_not_allowed_body(const std::vector<std::string_view>& allowed
     return body;
 }
 
+/// Retry policy, part one: only methods that are safe to repeat. A connection
+/// failure means the backend probably never saw the request, but the gateway
+/// cannot tell that apart from a failure after the backend acted, so unsafe
+/// methods are never replayed.
+bool is_retryable_method(std::string_view method) {
+    return method == "GET" || method == "HEAD" || method == "OPTIONS";
+}
+
+/// Retry policy, part two: which outcomes are transient. The same predicate
+/// decides what counts as a circuit-breaker failure, so the two never disagree.
+/// A backend's own 4xx, or a 500 it chose to return, is an answer rather than a
+/// transport problem and is passed straight through.
+bool is_transient_failure(ProxyStatus status, int backend_status) {
+    if (status != ProxyStatus::kForwarded) {
+        return true;  // Unreachable or timed out.
+    }
+    return backend_status == httplib::StatusCode::BadGateway_502 ||
+           backend_status == httplib::StatusCode::ServiceUnavailable_503 ||
+           backend_status == httplib::StatusCode::GatewayTimeout_504;
+}
+
+/// Copies an accepted attempt onto the response the client will receive.
+void apply_attempt(const httplib::Response& attempt, httplib::Response& response) {
+    response.status = attempt.status;
+    response.headers = attempt.headers;
+    response.body = attempt.body;
+}
+
 /// RFC 9110 requires a 405 response to carry an Allow header.
 std::string allow_header_value(const std::vector<std::string_view>& allowed_methods) {
     std::string value;
@@ -108,8 +137,9 @@ GatewayServer::GatewayServer(ServerConfig config)
 GatewayServer::GatewayServer(ServerConfig config, Router router)
     : config_(std::move(config)),
       health_(config_.backends),
+      breakers_(config_.backends, config_.circuit_failure_threshold, config_.circuit_cooldown),
       router_(std::move(router)),
-      balancer_(config_.backends, health_),
+      balancer_(config_.backends, health_, breakers_),
       proxy_(config_.backend_timeout),
       checker_(config_.backends, health_, config_.health_check_interval, config_.backend_timeout),
       http_(std::make_unique<httplib::Server>()) {
@@ -124,28 +154,9 @@ void GatewayServer::handle_service_request(const httplib::Request& request,
     const RouteMatch match = router_.match(request.method, request.path);
 
     switch (match.status) {
-        case MatchStatus::kMatched: {
-            const std::string& service = match.route->service;
-            const BackendEndpoint* backend = balancer_.select(service);
-            if (backend == nullptr) {
-                respond_gateway_error(response, httplib::StatusCode::BadGateway_502, "bad_gateway",
-                                      "no_backend_configured", service);
-                return;
-            }
-            switch (proxy_.forward(*backend, request, response)) {
-                case ProxyStatus::kForwarded:
-                    return;
-                case ProxyStatus::kBackendUnreachable:
-                    respond_gateway_error(response, httplib::StatusCode::BadGateway_502,
-                                          "bad_gateway", "backend_unreachable", service);
-                    return;
-                case ProxyStatus::kBackendTimeout:
-                    respond_gateway_error(response, httplib::StatusCode::GatewayTimeout_504,
-                                          "gateway_timeout", "backend_timeout", service);
-                    return;
-            }
+        case MatchStatus::kMatched:
+            dispatch_to_service(match.route->service, request, response);
             return;
-        }
 
         case MatchStatus::kMethodNotAllowed:
             response.status = httplib::StatusCode::MethodNotAllowed_405;
@@ -157,6 +168,98 @@ void GatewayServer::handle_service_request(const httplib::Request& request,
         case MatchStatus::kNotFound:
             response.status = httplib::StatusCode::NotFound_404;
             response.set_content(kNotFoundBody, kJsonContentType);
+            return;
+    }
+}
+
+void GatewayServer::dispatch_to_service(const std::string& service,
+                                       const httplib::Request& request,
+                                       httplib::Response& response) const {
+    const std::size_t max_forwards =
+        is_retryable_method(request.method) ? config_.max_retries + 1U : 1U;
+
+    // Every iteration marks one more instance as tried, so the loop ends once
+    // the service runs out of instances even if the retry budget does not.
+    std::vector<std::size_t> tried;
+    std::size_t forwards = 0;
+    bool refused_by_circuit = false;
+
+    ProxyStatus last_status = ProxyStatus::kBackendUnreachable;
+    httplib::Response last_attempt;
+
+    while (forwards < max_forwards) {
+        const LoadBalancer::Selection selection = balancer_.select(service, tried);
+        if (!selection) {
+            break;
+        }
+        tried.push_back(selection.index);
+
+        CircuitBreaker* breaker = breakers_.find(service, selection.index);
+        if (breaker != nullptr && !breaker->try_acquire()) {
+            refused_by_circuit = true;
+            continue;
+        }
+
+        httplib::Response attempt;
+        const ProxyStatus status = proxy_.forward(*selection.endpoint, request, attempt);
+        const bool transient = is_transient_failure(status, attempt.status);
+        if (breaker != nullptr) {
+            if (transient) {
+                breaker->record_failure();
+            } else {
+                breaker->record_success();
+            }
+        }
+
+        ++forwards;
+        if (!transient) {
+            apply_attempt(attempt, response);
+            return;
+        }
+        last_status = status;
+        last_attempt = std::move(attempt);
+    }
+
+    if (forwards == 0) {
+        // Nothing was contacted: either no instance is eligible at all, or the
+        // only candidates were circuits refusing traffic.
+        const auto circuit_is_blocking = [this, &service] {
+            const BackendTable& table = balancer_.backends();
+            const auto entry = table.find(service);
+            if (entry == table.end()) {
+                return false;
+            }
+            for (std::size_t index = 0; index < entry->second.size(); ++index) {
+                if (breakers_.blocks_selection(service, index)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        if (refused_by_circuit || circuit_is_blocking()) {
+            respond_gateway_error(response, httplib::StatusCode::ServiceUnavailable_503,
+                                  "service_unavailable", "circuit_open", service);
+        } else {
+            respond_gateway_error(response, httplib::StatusCode::BadGateway_502, "bad_gateway",
+                                  "no_backend_configured", service);
+        }
+        return;
+    }
+
+    switch (last_status) {
+        case ProxyStatus::kBackendTimeout:
+            respond_gateway_error(response, httplib::StatusCode::GatewayTimeout_504,
+                                  "gateway_timeout", "backend_timeout", service);
+            return;
+        case ProxyStatus::kBackendUnreachable:
+            respond_gateway_error(response, httplib::StatusCode::BadGateway_502, "bad_gateway",
+                                  "backend_unreachable", service);
+            return;
+        case ProxyStatus::kForwarded:
+            // The backend answered, just with a transient status. Its own
+            // response is more informative than a gateway error would be.
+            apply_attempt(last_attempt, response);
             return;
     }
 }
@@ -247,6 +350,9 @@ bool GatewayServer::run() {
         }
     }
     std::cout << "gateway: backend timeout " << proxy_.timeout().count() << "ms\n";
+    std::cout << "gateway: max retries " << config_.max_retries << ", circuit opens after "
+              << config_.circuit_failure_threshold << " failures for "
+              << config_.circuit_cooldown.count() << "ms\n";
     if (config_.health_check_interval.count() > 0) {
         std::cout << "gateway: health checks every " << config_.health_check_interval.count()
                   << "ms\n";

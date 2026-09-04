@@ -29,8 +29,8 @@ std::vector<std::uint16_t> selected_ports(const gateway::LoadBalancer& balancer,
     std::vector<std::uint16_t> ports;
     ports.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
-        const BackendEndpoint* chosen = balancer.select(service);
-        ports.push_back(chosen == nullptr ? 0 : chosen->port);
+        const auto chosen = balancer.select(service);
+        ports.push_back(chosen ? chosen.endpoint->port : 0);
     }
     return ports;
 }
@@ -59,9 +59,9 @@ TEST(LoadBalancerTest, ThreeInstancesRotateAndWrapAround) {
 TEST(LoadBalancerTest, SelectionStartsAtTheFirstConfiguredInstance) {
     SelectionPool pool(BackendTable{{"users", {at(9001), at(9002)}}});
 
-    const BackendEndpoint* first = pool.balancer.select("users");
-    ASSERT_NE(first, nullptr);
-    EXPECT_EQ(first->port, 9001);
+    const auto first = pool.balancer.select("users");
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first.endpoint->port, 9001);
 }
 
 TEST(LoadBalancerTest, EachServiceKeepsItsOwnPosition) {
@@ -71,13 +71,13 @@ TEST(LoadBalancerTest, EachServiceKeepsItsOwnPosition) {
     });
 
     // Interleave the services; neither may disturb the other's rotation.
-    EXPECT_EQ(pool.balancer.select("users")->port, 9001);
-    EXPECT_EQ(pool.balancer.select("orders")->port, 9010);
-    EXPECT_EQ(pool.balancer.select("users")->port, 9002);
-    EXPECT_EQ(pool.balancer.select("orders")->port, 9011);
-    EXPECT_EQ(pool.balancer.select("users")->port, 9003);
-    EXPECT_EQ(pool.balancer.select("orders")->port, 9010);
-    EXPECT_EQ(pool.balancer.select("users")->port, 9001);
+    EXPECT_EQ(pool.balancer.select("users").endpoint->port, 9001);
+    EXPECT_EQ(pool.balancer.select("orders").endpoint->port, 9010);
+    EXPECT_EQ(pool.balancer.select("users").endpoint->port, 9002);
+    EXPECT_EQ(pool.balancer.select("orders").endpoint->port, 9011);
+    EXPECT_EQ(pool.balancer.select("users").endpoint->port, 9003);
+    EXPECT_EQ(pool.balancer.select("orders").endpoint->port, 9010);
+    EXPECT_EQ(pool.balancer.select("users").endpoint->port, 9001);
 }
 
 TEST(LoadBalancerTest, DistributionIsEvenOverManyRotations) {
@@ -97,20 +97,20 @@ TEST(LoadBalancerTest, DistributionIsEvenOverManyRotations) {
 TEST(LoadBalancerTest, UnknownServiceSelectsNothing) {
     SelectionPool pool(BackendTable{{"users", {at(9001)}}});
 
-    EXPECT_EQ(pool.balancer.select("orders"), nullptr);
+    EXPECT_FALSE(pool.balancer.select("orders"));
 }
 
 TEST(LoadBalancerTest, ServiceWithNoInstancesSelectsNothing) {
     SelectionPool pool(BackendTable{{"users", {}}});
 
-    EXPECT_EQ(pool.balancer.select("users"), nullptr);
-    EXPECT_EQ(pool.balancer.select("users"), nullptr) << "an empty pool must stay safe to call";
+    EXPECT_FALSE(pool.balancer.select("users"));
+    EXPECT_FALSE(pool.balancer.select("users")) << "an empty pool must stay safe to call";
 }
 
 TEST(LoadBalancerTest, EmptyTableSelectsNothing) {
     SelectionPool pool{BackendTable{}};
 
-    EXPECT_EQ(pool.balancer.select("users"), nullptr);
+    EXPECT_FALSE(pool.balancer.select("users"));
 }
 
 TEST(LoadBalancerTest, ConcurrentSelectionStaysBalancedAndValid) {
@@ -129,12 +129,12 @@ TEST(LoadBalancerTest, ConcurrentSelectionStaysBalancedAndValid) {
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&] {
             for (int i = 0; i < kPerThread; ++i) {
-                const BackendEndpoint* chosen = pool.balancer.select("users");
-                if (chosen == nullptr) {
+                const auto chosen = pool.balancer.select("users");
+                if (!chosen) {
                     ++unexpected;
                     continue;
                 }
-                switch (chosen->port) {
+                switch (chosen.endpoint->port) {
                     case 9001: ++port_9001; break;
                     case 9002: ++port_9002; break;
                     case 9003: ++port_9003; break;
@@ -159,9 +159,9 @@ TEST(LoadBalancerTest, ConcurrentSelectionStaysBalancedAndValid) {
 TEST(LoadBalancerTest, DefaultTableShipsAMultiInstanceService) {
     SelectionPool pool(gateway::default_backends());
 
-    ASSERT_NE(pool.balancer.select("users"), nullptr);
+    ASSERT_TRUE(pool.balancer.select("users"));
     EXPECT_GT(pool.balancer.backends().at("users").size(), 1U);
-    EXPECT_EQ(pool.balancer.select("nonexistent"), nullptr);
+    EXPECT_FALSE(pool.balancer.select("nonexistent"));
 }
 
 }  // namespace

@@ -33,6 +33,9 @@ struct ServerConfig {
     static constexpr const char* kDefaultHost = "0.0.0.0";
     static constexpr std::chrono::milliseconds kDefaultBackendTimeout{5000};
     static constexpr std::chrono::milliseconds kDefaultHealthCheckInterval{5000};
+    static constexpr unsigned kDefaultMaxRetries = 1;
+    static constexpr unsigned kDefaultCircuitFailureThreshold = 5;
+    static constexpr std::chrono::milliseconds kDefaultCircuitCooldown{5000};
 
     std::string host{kDefaultHost};
     std::uint16_t port{kDefaultPort};
@@ -49,15 +52,28 @@ struct ServerConfig {
     /// How often each backend instance is probed with GET /health. Zero turns
     /// health checking off, leaving every configured instance eligible.
     std::chrono::milliseconds health_check_interval{kDefaultHealthCheckInterval};
+
+    /// Extra attempts allowed after a transient failure, on top of the first
+    /// one. Only safe methods are retried, and never onto an instance this
+    /// request has already tried. Zero disables retries.
+    unsigned max_retries{kDefaultMaxRetries};
+
+    /// Consecutive transient failures that open a backend instance's circuit.
+    unsigned circuit_failure_threshold{kDefaultCircuitFailureThreshold};
+
+    /// How long an open circuit refuses traffic before admitting one probe.
+    std::chrono::milliseconds circuit_cooldown{kDefaultCircuitCooldown};
 };
 
 /// Builds a ServerConfig from the process environment and command line.
 ///
 /// Precedence, lowest to highest: built-in defaults, environment variables
 /// (GATEWAY_HOST, GATEWAY_PORT, GATEWAY_BACKENDS, GATEWAY_BACKEND_TIMEOUT_MS,
-/// GATEWAY_HEALTH_CHECK_INTERVAL_MS), then the matching `--host`, `--port`,
-/// `--backend`, `--backend-timeout-ms` and `--health-check-interval-ms`
-/// arguments.
+/// GATEWAY_HEALTH_CHECK_INTERVAL_MS, GATEWAY_MAX_RETRIES,
+/// GATEWAY_CIRCUIT_FAILURE_THRESHOLD, GATEWAY_CIRCUIT_COOLDOWN_MS), then the
+/// matching `--host`, `--port`, `--backend`, `--backend-timeout-ms`,
+/// `--health-check-interval-ms`, `--max-retries`,
+/// `--circuit-failure-threshold` and `--circuit-cooldown-ms` arguments.
 ///
 /// The first backend given from any source replaces the built-in table; further
 /// ones add an instance, so repeating a service name gives it several

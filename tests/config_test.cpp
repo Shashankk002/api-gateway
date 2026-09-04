@@ -27,6 +27,9 @@ protected:
         ::unsetenv("GATEWAY_BACKENDS");
         ::unsetenv("GATEWAY_BACKEND_TIMEOUT_MS");
         ::unsetenv("GATEWAY_HEALTH_CHECK_INTERVAL_MS");
+        ::unsetenv("GATEWAY_MAX_RETRIES");
+        ::unsetenv("GATEWAY_CIRCUIT_FAILURE_THRESHOLD");
+        ::unsetenv("GATEWAY_CIRCUIT_COOLDOWN_MS");
     }
 };
 
@@ -192,6 +195,63 @@ TEST_F(ConfigTest, HealthCheckIntervalIsConfigurable) {
 TEST_F(ConfigTest, ZeroHealthCheckIntervalDisablesChecking) {
     EXPECT_EQ(load({"--health-check-interval-ms", "0"}).health_check_interval,
               std::chrono::milliseconds{0});
+}
+
+TEST_F(ConfigTest, ReliabilityDefaultsAreConservative) {
+    const auto config = load({});
+
+    EXPECT_EQ(config.max_retries, gateway::ServerConfig::kDefaultMaxRetries);
+    EXPECT_LE(config.max_retries, 2U) << "the default retry budget must stay small";
+    EXPECT_EQ(config.circuit_failure_threshold,
+              gateway::ServerConfig::kDefaultCircuitFailureThreshold);
+    EXPECT_GE(config.circuit_failure_threshold, 1U);
+    EXPECT_EQ(config.circuit_cooldown, gateway::ServerConfig::kDefaultCircuitCooldown);
+    EXPECT_GT(config.circuit_cooldown.count(), 0);
+}
+
+TEST_F(ConfigTest, ReliabilitySettingsAreConfigurableByFlag) {
+    const auto config = load({"--max-retries", "3", "--circuit-failure-threshold", "7",
+                              "--circuit-cooldown-ms", "1500"});
+
+    EXPECT_EQ(config.max_retries, 3U);
+    EXPECT_EQ(config.circuit_failure_threshold, 7U);
+    EXPECT_EQ(config.circuit_cooldown, std::chrono::milliseconds{1500});
+}
+
+TEST_F(ConfigTest, ReliabilitySettingsAreConfigurableByEnvironment) {
+    ::setenv("GATEWAY_MAX_RETRIES", "2", 1);
+    ::setenv("GATEWAY_CIRCUIT_FAILURE_THRESHOLD", "9", 1);
+    ::setenv("GATEWAY_CIRCUIT_COOLDOWN_MS", "2500", 1);
+
+    EXPECT_EQ(load({}).max_retries, 2U);
+    EXPECT_EQ(load({}).circuit_failure_threshold, 9U);
+    EXPECT_EQ(load({}).circuit_cooldown, std::chrono::milliseconds{2500});
+
+    // Flags still win over the environment.
+    EXPECT_EQ(load({"--max-retries", "0"}).max_retries, 0U);
+}
+
+TEST_F(ConfigTest, ZeroRetriesAndZeroCooldownAreAccepted) {
+    EXPECT_EQ(load({"--max-retries", "0"}).max_retries, 0U);
+    EXPECT_EQ(load({"--circuit-cooldown-ms", "0"}).circuit_cooldown,
+              std::chrono::milliseconds{0});
+}
+
+TEST_F(ConfigTest, RejectsInvalidReliabilitySettings) {
+    EXPECT_THROW((void)load({"--max-retries", "11"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--max-retries", "many"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--max-retries", "-1"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--max-retries"}), std::invalid_argument);
+
+    // A zero threshold would open a circuit before any request was made.
+    EXPECT_THROW((void)load({"--circuit-failure-threshold", "0"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--circuit-failure-threshold", "1001"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--circuit-failure-threshold"}), std::invalid_argument);
+
+    EXPECT_THROW((void)load({"--circuit-cooldown-ms", "3600001"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--circuit-cooldown-ms", "99999999999999999999"}),
+                 std::invalid_argument);
+    EXPECT_THROW((void)load({"--circuit-cooldown-ms"}), std::invalid_argument);
 }
 
 TEST_F(ConfigTest, RejectsMalformedOrUnreasonableHealthCheckInterval) {

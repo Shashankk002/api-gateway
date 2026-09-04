@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "gateway/circuit_breaker.hpp"
 #include "gateway/config.hpp"
 #include "gateway/health.hpp"
 #include "gateway/load_balancer.hpp"
@@ -204,19 +205,33 @@ private:
     std::size_t health_checks_{0};
 };
 
-/// A LoadBalancer with the health state and backend table it needs, for tests
-/// that exercise selection without opening a socket. Members are declared in
-/// the order the balancer depends on them.
+/// A LoadBalancer with the health state, circuit breakers and backend table it
+/// needs, for tests that exercise selection without opening a socket. Members
+/// are declared in the order the balancer depends on them.
+///
+/// The default failure threshold is high enough that a test never trips a
+/// circuit unless it means to.
 class SelectionPool {
 public:
-    explicit SelectionPool(gateway::BackendTable table)
-        : backends(std::move(table)), health(backends), balancer(backends, health) {}
+    explicit SelectionPool(gateway::BackendTable table, unsigned failure_threshold = 1000,
+                           std::chrono::milliseconds cooldown = std::chrono::milliseconds{60000})
+        : backends(std::move(table)),
+          health(backends),
+          breakers(backends, failure_threshold, cooldown),
+          balancer(backends, health, breakers) {}
 
     SelectionPool(const SelectionPool&) = delete;
     SelectionPool& operator=(const SelectionPool&) = delete;
 
+    /// Port of the next selection, or 0 when nothing is eligible.
+    [[nodiscard]] std::uint16_t next_port(std::string_view service) {
+        const auto selection = balancer.select(service);
+        return selection ? selection.endpoint->port : 0;
+    }
+
     gateway::BackendTable backends;
     gateway::BackendHealth health;
+    gateway::CircuitBreakers breakers;
     gateway::LoadBalancer balancer;
 };
 
@@ -268,6 +283,9 @@ protected:
 
     /// Health state of the running gateway, for waiting on transitions.
     [[nodiscard]] const gateway::BackendHealth& health() const { return server_->health(); }
+
+    /// Circuit breakers of the running gateway, for asserting on their state.
+    [[nodiscard]] const gateway::CircuitBreakers& breakers() const { return server_->breakers(); }
 
     /// Waits for `predicate` to hold, bounded, without polling sleeps.
     [[nodiscard]] bool wait_for_health(const std::function<bool()>& predicate) const {

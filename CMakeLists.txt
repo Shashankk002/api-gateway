@@ -31,6 +31,7 @@ endif()
 # Core library: everything except the process entry point, so that tests can
 # link the real server rather than a copy of it.
 add_library(api_gateway_core
+    src/circuit_breaker.cpp
     src/config.cpp
     src/health.cpp
     src/load_balancer.cpp

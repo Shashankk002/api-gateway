@@ -1,6 +1,7 @@
 include(GoogleTest)
 
 add_executable(api_gateway_tests
+    circuit_breaker_test.cpp
     config_test.cpp
     health_check_integration_test.cpp
     health_check_test.cpp
@@ -8,6 +9,7 @@ add_executable(api_gateway_tests
     load_balancer_test.cpp
     load_balancing_integration_test.cpp
     proxy_integration_test.cpp
+    reliability_integration_test.cpp
     router_test.cpp
     routing_integration_test.cpp)
 

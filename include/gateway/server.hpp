@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 
+#include "gateway/circuit_breaker.hpp"
 #include "gateway/config.hpp"
 #include "gateway/health.hpp"
 #include "gateway/load_balancer.hpp"
@@ -22,8 +23,11 @@ namespace gateway {
 /// It answers `GET /health` itself and delegates every other path to a Router,
 /// which decides whether the request belongs to a logical service, is
 /// method-not-allowed, or is unknown. For a matched request the LoadBalancer
-/// picks one of that service's healthy backend instances and the ReverseProxy
-/// forwards to it. The server holds none of that logic itself.
+/// picks one of that service's eligible backend instances and the ReverseProxy
+/// forwards to it. On a transient failure the server may retry onto another
+/// eligible instance within a bounded budget, recording each outcome in that
+/// instance's circuit breaker. The server holds none of the routing, selection
+/// or forwarding logic itself; it sequences them.
 ///
 /// A HealthChecker runs in the background for the object's lifetime, keeping the
 /// health state the LoadBalancer reads up to date. It starts on construction and
@@ -74,6 +78,7 @@ public:
     [[nodiscard]] const ServerConfig& config() const noexcept { return config_; }
     [[nodiscard]] const Router& router() const noexcept { return router_; }
     [[nodiscard]] const BackendHealth& health() const noexcept { return health_; }
+    [[nodiscard]] const CircuitBreakers& breakers() const noexcept { return breakers_; }
     [[nodiscard]] const LoadBalancer& balancer() const noexcept { return balancer_; }
     [[nodiscard]] const ReverseProxy& proxy() const noexcept { return proxy_; }
 
@@ -84,10 +89,16 @@ private:
     /// selected backend instance when the request matches a route.
     void handle_service_request(const httplib::Request& request, httplib::Response& response) const;
 
+    /// Selects an eligible instance of `service`, forwards to it, and retries
+    /// onto other instances while the failure is transient and budget remains.
+    void dispatch_to_service(const std::string& service, const httplib::Request& request,
+                             httplib::Response& response) const;
+
     // Declaration order is also destruction order reversed: health_ outlives
     // both the balancer that reads it and the checker that writes it.
     ServerConfig config_;
     BackendHealth health_;
+    CircuitBreakers breakers_;
     Router router_;
     LoadBalancer balancer_;
     ReverseProxy proxy_;

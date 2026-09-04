@@ -33,8 +33,8 @@ std::vector<std::uint16_t> selected_ports(const gateway::LoadBalancer& balancer,
     std::vector<std::uint16_t> ports;
     ports.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
-        const BackendEndpoint* chosen = balancer.select(service);
-        ports.push_back(chosen == nullptr ? 0 : chosen->port);
+        const auto chosen = balancer.select(service);
+        ports.push_back(chosen ? chosen.endpoint->port : 0);
     }
     return ports;
 }
@@ -126,8 +126,8 @@ TEST(SelectionWithHealthTest, AllUnhealthyMeansNothingIsSelectable) {
         pool.health.set_healthy("users", index, false);
     }
 
-    EXPECT_EQ(pool.balancer.select("users"), nullptr);
-    EXPECT_EQ(pool.balancer.select("users"), nullptr);
+    EXPECT_FALSE(pool.balancer.select("users"));
+    EXPECT_FALSE(pool.balancer.select("users"));
 }
 
 TEST(SelectionWithHealthTest, RecoveredInstanceBecomesSelectableAgain) {
@@ -153,13 +153,13 @@ TEST(SelectionWithHealthTest, RecoveryFromEverythingUnhealthyWorks) {
     for (std::size_t index = 0; index < 3; ++index) {
         pool.health.set_healthy("users", index, false);
     }
-    ASSERT_EQ(pool.balancer.select("users"), nullptr);
+    ASSERT_FALSE(pool.balancer.select("users"));
 
     pool.health.set_healthy("users", 2, true);
 
-    const BackendEndpoint* chosen = pool.balancer.select("users");
-    ASSERT_NE(chosen, nullptr);
-    EXPECT_EQ(chosen->port, 9003);
+    const auto chosen = pool.balancer.select("users");
+    ASSERT_TRUE(chosen);
+    EXPECT_EQ(chosen.endpoint->port, 9003);
 }
 
 TEST(SelectionWithHealthTest, ServicesKeepIndependentHealthAndPosition) {
@@ -170,11 +170,11 @@ TEST(SelectionWithHealthTest, ServicesKeepIndependentHealthAndPosition) {
     pool.health.set_healthy("users", 0, false);
 
     // users is down to one instance; orders must be untouched.
-    EXPECT_EQ(pool.balancer.select("users")->port, 9002);
-    EXPECT_EQ(pool.balancer.select("orders")->port, 9010);
-    EXPECT_EQ(pool.balancer.select("users")->port, 9002);
-    EXPECT_EQ(pool.balancer.select("orders")->port, 9011);
-    EXPECT_EQ(pool.balancer.select("orders")->port, 9010);
+    EXPECT_EQ(pool.balancer.select("users").endpoint->port, 9002);
+    EXPECT_EQ(pool.balancer.select("orders").endpoint->port, 9010);
+    EXPECT_EQ(pool.balancer.select("users").endpoint->port, 9002);
+    EXPECT_EQ(pool.balancer.select("orders").endpoint->port, 9011);
+    EXPECT_EQ(pool.balancer.select("orders").endpoint->port, 9010);
 }
 
 TEST(SelectionWithHealthTest, ConcurrentUpdatesAndSelectionsStayValid) {
@@ -202,8 +202,8 @@ TEST(SelectionWithHealthTest, ConcurrentUpdatesAndSelectionsStayValid) {
     for (int t = 0; t < kSelectors; ++t) {
         selectors.emplace_back([&pool, &invalid, &selected] {
             for (int i = 0; i < kSelectionsPerThread; ++i) {
-                const BackendEndpoint* chosen = pool.balancer.select("users");
-                if (chosen == nullptr || chosen->port < 9001 || chosen->port > 9003) {
+                const auto chosen = pool.balancer.select("users");
+                if (!chosen || chosen.endpoint->port < 9001 || chosen.endpoint->port > 9003) {
                     ++invalid;
                     continue;
                 }
