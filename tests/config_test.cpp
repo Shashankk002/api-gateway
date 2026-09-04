@@ -30,6 +30,15 @@ protected:
         ::unsetenv("GATEWAY_MAX_RETRIES");
         ::unsetenv("GATEWAY_CIRCUIT_FAILURE_THRESHOLD");
         ::unsetenv("GATEWAY_CIRCUIT_COOLDOWN_MS");
+        ::unsetenv("GATEWAY_RATE_LIMIT");
+        ::unsetenv("GATEWAY_RATE_LIMIT_ALGORITHM");
+        ::unsetenv("GATEWAY_RATE_LIMIT_REQUESTS");
+        ::unsetenv("GATEWAY_RATE_LIMIT_WINDOW_MS");
+        ::unsetenv("GATEWAY_RATE_LIMIT_MODE");
+        ::unsetenv("GATEWAY_REDIS_HOST");
+        ::unsetenv("GATEWAY_REDIS_PORT");
+        ::unsetenv("GATEWAY_REDIS_KEY_PREFIX");
+        ::unsetenv("GATEWAY_REDIS_FAILURE_POLICY");
     }
 };
 
@@ -252,6 +261,72 @@ TEST_F(ConfigTest, RejectsInvalidReliabilitySettings) {
     EXPECT_THROW((void)load({"--circuit-cooldown-ms", "99999999999999999999"}),
                  std::invalid_argument);
     EXPECT_THROW((void)load({"--circuit-cooldown-ms"}), std::invalid_argument);
+}
+
+TEST_F(ConfigTest, RateLimitingIsOffByDefault) {
+    const auto config = load({});
+
+    EXPECT_FALSE(config.rate_limit_enabled) << "throttling must be an explicit decision";
+    EXPECT_EQ(config.rate_limit_algorithm, gateway::RateLimitAlgorithm::kTokenBucket);
+    EXPECT_EQ(config.rate_limit_mode, gateway::RateLimitMode::kLocal);
+    EXPECT_EQ(config.rate_limit_requests, gateway::ServerConfig::kDefaultRateLimitRequests);
+    EXPECT_EQ(config.rate_limit_window, gateway::ServerConfig::kDefaultRateLimitWindow);
+    EXPECT_EQ(config.redis_failure_policy, gateway::RedisFailurePolicy::kFailOpen);
+    EXPECT_EQ(config.redis_port, gateway::ServerConfig::kDefaultRedisPort);
+}
+
+TEST_F(ConfigTest, RateLimitSettingsAreConfigurableByFlag) {
+    const auto config =
+        load({"--rate-limit", "on", "--rate-limit-algorithm", "sliding-window",
+              "--rate-limit-requests", "50", "--rate-limit-window-ms", "5000",
+              "--rate-limit-mode", "redis", "--redis-host", "10.0.0.9", "--redis-port", "6380",
+              "--redis-key-prefix", "edge:rl", "--redis-failure-policy", "closed"});
+
+    EXPECT_TRUE(config.rate_limit_enabled);
+    EXPECT_EQ(config.rate_limit_algorithm, gateway::RateLimitAlgorithm::kSlidingWindow);
+    EXPECT_EQ(config.rate_limit_requests, 50U);
+    EXPECT_EQ(config.rate_limit_window, std::chrono::milliseconds{5000});
+    EXPECT_EQ(config.rate_limit_mode, gateway::RateLimitMode::kRedis);
+    EXPECT_EQ(config.redis_host, "10.0.0.9");
+    EXPECT_EQ(config.redis_port, 6380);
+    EXPECT_EQ(config.redis_key_prefix, "edge:rl");
+    EXPECT_EQ(config.redis_failure_policy, gateway::RedisFailurePolicy::kFailClosed);
+}
+
+TEST_F(ConfigTest, RateLimitSettingsAreConfigurableByEnvironment) {
+    ::setenv("GATEWAY_RATE_LIMIT", "true", 1);
+    ::setenv("GATEWAY_RATE_LIMIT_ALGORITHM", "sliding-window", 1);
+    ::setenv("GATEWAY_RATE_LIMIT_REQUESTS", "25", 1);
+    ::setenv("GATEWAY_RATE_LIMIT_MODE", "redis", 1);
+    ::setenv("GATEWAY_REDIS_FAILURE_POLICY", "closed", 1);
+
+    const auto config = load({});
+    EXPECT_TRUE(config.rate_limit_enabled);
+    EXPECT_EQ(config.rate_limit_algorithm, gateway::RateLimitAlgorithm::kSlidingWindow);
+    EXPECT_EQ(config.rate_limit_requests, 25U);
+    EXPECT_EQ(config.rate_limit_mode, gateway::RateLimitMode::kRedis);
+    EXPECT_EQ(config.redis_failure_policy, gateway::RedisFailurePolicy::kFailClosed);
+
+    // Flags still win over the environment.
+    EXPECT_FALSE(load({"--rate-limit", "off"}).rate_limit_enabled);
+}
+
+TEST_F(ConfigTest, RejectsInvalidRateLimitSettings) {
+    EXPECT_THROW((void)load({"--rate-limit", "maybe"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--rate-limit"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--rate-limit-algorithm", "leaky-bucket"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--rate-limit-mode", "memcached"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--redis-failure-policy", "maybe"}), std::invalid_argument);
+
+    // A zero limit would reject everything; a zero window would divide by zero.
+    EXPECT_THROW((void)load({"--rate-limit-requests", "0"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--rate-limit-requests", "1000001"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--rate-limit-window-ms", "0"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--rate-limit-window-ms", "3600001"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--rate-limit-requests", "99999999999999999999"}),
+                 std::invalid_argument);
+    EXPECT_THROW((void)load({"--redis-port", "0"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--redis-port", "70000"}), std::invalid_argument);
 }
 
 TEST_F(ConfigTest, RejectsMalformedOrUnreasonableHealthCheckInterval) {

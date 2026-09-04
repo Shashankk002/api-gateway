@@ -15,6 +15,16 @@ FetchContent_Declare(httplib
     GIT_TAG v0.18.7
     GIT_SHALLOW ON)
 
+# hiredis: minimal C client for the Redis-backed rate limiter. Chosen over a
+# heavier C++ wrapper because the gateway only needs EVALSHA/EVAL.
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(DISABLE_TESTS ON CACHE BOOL "" FORCE)
+set(ENABLE_SSL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(hiredis
+    GIT_REPOSITORY https://github.com/redis/hiredis.git
+    GIT_TAG v1.4.1
+    GIT_SHALLOW ON)
+
 if(API_GATEWAY_BUILD_TESTS)
     set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
@@ -22,7 +32,13 @@ if(API_GATEWAY_BUILD_TESTS)
         GIT_REPOSITORY https://github.com/google/googletest.git
         GIT_TAG v1.15.2
         GIT_SHALLOW ON)
-    FetchContent_MakeAvailable(httplib googletest)
+    FetchContent_MakeAvailable(httplib hiredis googletest)
 else()
-    FetchContent_MakeAvailable(httplib)
+    FetchContent_MakeAvailable(httplib hiredis)
 endif()
+
+# hiredis headers are C and trip the project's strict warnings, so consumers see
+# them as system headers.
+get_target_property(hiredis_include_dirs hiredis INTERFACE_INCLUDE_DIRECTORIES)
+set_target_properties(hiredis PROPERTIES
+    INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${hiredis_include_dirs}")

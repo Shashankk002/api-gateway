@@ -9,6 +9,9 @@ add_executable(api_gateway_tests
     load_balancer_test.cpp
     load_balancing_integration_test.cpp
     proxy_integration_test.cpp
+    rate_limit_integration_test.cpp
+    rate_limiter_test.cpp
+    redis_rate_limit_test.cpp
     reliability_integration_test.cpp
     router_test.cpp
     routing_integration_test.cpp)

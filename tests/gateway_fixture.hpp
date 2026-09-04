@@ -19,6 +19,7 @@
 #include "gateway/config.hpp"
 #include "gateway/health.hpp"
 #include "gateway/load_balancer.hpp"
+#include "gateway/rate_limiter.hpp"
 #include "gateway/router.hpp"
 #include "gateway/server.hpp"
 
@@ -286,6 +287,9 @@ protected:
 
     /// Circuit breakers of the running gateway, for asserting on their state.
     [[nodiscard]] const gateway::CircuitBreakers& breakers() const { return server_->breakers(); }
+
+    /// The running gateway's rate limiter, or nullptr when disabled.
+    [[nodiscard]] gateway::RateLimiter* rate_limiter() const { return server_->rate_limiter(); }
 
     /// Waits for `predicate` to hold, bounded, without polling sleeps.
     [[nodiscard]] bool wait_for_health(const std::function<bool()>& predicate) const {

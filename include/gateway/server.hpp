@@ -8,6 +8,7 @@
 #include "gateway/health.hpp"
 #include "gateway/load_balancer.hpp"
 #include "gateway/proxy.hpp"
+#include "gateway/rate_limiter.hpp"
 #include "gateway/router.hpp"
 
 namespace httplib {
@@ -23,8 +24,10 @@ namespace gateway {
 /// It answers `GET /health` itself and delegates every other path to a Router,
 /// which decides whether the request belongs to a logical service, is
 /// method-not-allowed, or is unknown. For a matched request the LoadBalancer
-/// picks one of that service's eligible backend instances and the ReverseProxy
-/// forwards to it. On a transient failure the server may retry onto another
+/// is rate limited first; if it is over its allowance the gateway answers 429
+/// without touching any backend machinery. Otherwise the LoadBalancer picks one
+/// of that service's eligible backend instances and the ReverseProxy forwards
+/// to it. On a transient failure the server may retry onto another
 /// eligible instance within a bounded budget, recording each outcome in that
 /// instance's circuit breaker. The server holds none of the routing, selection
 /// or forwarding logic itself; it sequences them.
@@ -79,6 +82,14 @@ public:
     [[nodiscard]] const Router& router() const noexcept { return router_; }
     [[nodiscard]] const BackendHealth& health() const noexcept { return health_; }
     [[nodiscard]] const CircuitBreakers& breakers() const noexcept { return breakers_; }
+
+    /// The active limiter, or nullptr when rate limiting is disabled.
+    [[nodiscard]] RateLimiter* rate_limiter() const noexcept { return limiter_.get(); }
+
+    /// The key a request is rate limited under. Currently the peer address the
+    /// socket reports; client-supplied headers are never trusted, so nothing a
+    /// caller sends can move it into someone else's bucket.
+    [[nodiscard]] static std::string client_key(const httplib::Request& request);
     [[nodiscard]] const LoadBalancer& balancer() const noexcept { return balancer_; }
     [[nodiscard]] const ReverseProxy& proxy() const noexcept { return proxy_; }
 
@@ -97,6 +108,7 @@ private:
     // Declaration order is also destruction order reversed: health_ outlives
     // both the balancer that reads it and the checker that writes it.
     ServerConfig config_;
+    std::unique_ptr<RateLimiter> limiter_;
     BackendHealth health_;
     CircuitBreakers breakers_;
     Router router_;

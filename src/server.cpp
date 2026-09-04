@@ -11,6 +11,8 @@
 
 #include "gateway/circuit_breaker.hpp"
 #include "gateway/health.hpp"
+#include "gateway/rate_limiter.hpp"
+#include "gateway/redis_rate_limiter.hpp"
 #include "gateway/load_balancer.hpp"
 #include "gateway/proxy.hpp"
 #include "gateway/router.hpp"
@@ -117,6 +119,35 @@ void apply_attempt(const httplib::Response& attempt, httplib::Response& response
     response.body = attempt.body;
 }
 
+/// Builds the limiter the configuration asks for, or nothing when rate limiting
+/// is off. "requests per window" maps onto the token bucket as a capacity of
+/// that many refilled over the same window.
+std::unique_ptr<RateLimiter> make_rate_limiter(const ServerConfig& config) {
+    if (!config.rate_limit_enabled) {
+        return nullptr;
+    }
+    const double per_second = static_cast<double>(config.rate_limit_requests) /
+                              (static_cast<double>(config.rate_limit_window.count()) / 1000.0);
+
+    if (config.rate_limit_mode == RateLimitMode::kRedis) {
+        return std::make_unique<RedisRateLimiter>(
+            config.redis_host, config.redis_port, config.redis_key_prefix,
+            config.rate_limit_requests, config.rate_limit_window, config.redis_failure_policy);
+    }
+    if (config.rate_limit_algorithm == RateLimitAlgorithm::kSlidingWindow) {
+        return std::make_unique<SlidingWindowLimiter>(config.rate_limit_requests,
+                                                      config.rate_limit_window);
+    }
+    return std::make_unique<TokenBucketLimiter>(config.rate_limit_requests, per_second);
+}
+
+/// Advertises the caller's standing. Applied to allowed responses too, after
+/// the proxy has written the backend's headers, so it is not overwritten.
+void apply_rate_limit_headers(httplib::Response& response, const RateLimitDecision& decision) {
+    response.set_header("RateLimit-Limit", std::to_string(decision.limit));
+    response.set_header("RateLimit-Remaining", std::to_string(decision.remaining));
+}
+
 /// RFC 9110 requires a 405 response to carry an Allow header.
 std::string allow_header_value(const std::vector<std::string_view>& allowed_methods) {
     std::string value;
@@ -136,6 +167,7 @@ GatewayServer::GatewayServer(ServerConfig config)
 
 GatewayServer::GatewayServer(ServerConfig config, Router router)
     : config_(std::move(config)),
+      limiter_(make_rate_limiter(config_)),
       health_(config_.backends),
       breakers_(config_.backends, config_.circuit_failure_threshold, config_.circuit_cooldown),
       router_(std::move(router)),
@@ -154,9 +186,32 @@ void GatewayServer::handle_service_request(const httplib::Request& request,
     const RouteMatch match = router_.match(request.method, request.path);
 
     switch (match.status) {
-        case MatchStatus::kMatched:
+        case MatchStatus::kMatched: {
+            if (limiter_ == nullptr) {
+                dispatch_to_service(match.route->service, request, response);
+                return;
+            }
+
+            // Runs before any backend machinery: a rejected request never picks
+            // an instance, never touches a circuit and never spends retry budget.
+            const RateLimitDecision decision =
+                limiter_->acquire(client_key(request), RateLimiter::Clock::now());
+            if (!decision.allowed) {
+                respond_gateway_error(response, httplib::StatusCode::TooManyRequests_429,
+                                      "rate_limited", "rate_limit_exceeded",
+                                      match.route->service);
+                apply_rate_limit_headers(response, decision);
+                if (decision.retry_after.count() > 0) {
+                    const auto seconds = (decision.retry_after.count() + 999) / 1000;
+                    response.set_header("Retry-After", std::to_string(seconds));
+                }
+                return;
+            }
+
             dispatch_to_service(match.route->service, request, response);
+            apply_rate_limit_headers(response, decision);
             return;
+        }
 
         case MatchStatus::kMethodNotAllowed:
             response.status = httplib::StatusCode::MethodNotAllowed_405;
@@ -264,6 +319,13 @@ void GatewayServer::dispatch_to_service(const std::string& service,
     }
 }
 
+std::string GatewayServer::client_key(const httplib::Request& request) {
+    // The peer address the socket reports. X-Forwarded-For and friends are
+    // ignored: without trusted-proxy configuration they are client-supplied and
+    // would let anyone escape their own bucket.
+    return request.remote_addr.empty() ? std::string("unknown") : request.remote_addr;
+}
+
 void GatewayServer::register_routes() {
     http_->Get(kHealthPath, [](const httplib::Request&, httplib::Response& response) {
         response.set_content(kHealthyBody, kJsonContentType);
@@ -353,6 +415,17 @@ bool GatewayServer::run() {
     std::cout << "gateway: max retries " << config_.max_retries << ", circuit opens after "
               << config_.circuit_failure_threshold << " failures for "
               << config_.circuit_cooldown.count() << "ms\n";
+    if (limiter_ == nullptr) {
+        std::cout << "gateway: rate limiting disabled\n";
+    } else {
+        std::cout << "gateway: rate limit "
+                  << (config_.rate_limit_mode == RateLimitMode::kRedis ? "redis " : "local ")
+                  << (config_.rate_limit_algorithm == RateLimitAlgorithm::kSlidingWindow
+                          ? "sliding-window "
+                          : "token-bucket ")
+                  << config_.rate_limit_requests << " per " << config_.rate_limit_window.count()
+                  << "ms per client\n";
+    }
     if (config_.health_check_interval.count() > 0) {
         std::cout << "gateway: health checks every " << config_.health_check_interval.count()
                   << "ms\n";

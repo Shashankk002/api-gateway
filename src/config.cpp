@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <initializer_list>
 #include <utility>
 
 namespace gateway {
@@ -17,6 +18,8 @@ namespace {
 constexpr unsigned long kMaxRetriesLimit = 10;
 constexpr unsigned long kMaxFailureThreshold = 1000;
 constexpr unsigned long kMaxCooldownMs = 3600000;
+constexpr unsigned long kMaxRateLimitRequests = 1000000;
+constexpr unsigned long kMaxRateLimitWindowMs = 3600000;
 
 std::uint16_t parse_port(std::string_view text, std::string_view source) {
     unsigned long value = 0;
@@ -49,6 +52,51 @@ std::chrono::milliseconds parse_timeout_ms(std::string_view text, std::string_vi
                                     std::string(text) + "'");
     }
     return std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(value));
+}
+
+/// Parses one of a fixed set of spellings, so an unknown value is rejected
+/// rather than silently defaulted.
+template <typename Value>
+Value parse_choice(std::string_view text, std::string_view source,
+                   std::initializer_list<std::pair<std::string_view, Value>> choices) {
+    for (const auto& [name, value] : choices) {
+        if (text == name) {
+            return value;
+        }
+    }
+    std::string expected;
+    for (const auto& [name, value] : choices) {
+        if (!expected.empty()) {
+            expected += "|";
+        }
+        expected.append(name);
+    }
+    throw std::invalid_argument(std::string(source) + ": expected " + expected + ", got '" +
+                                std::string(text) + "'");
+}
+
+bool parse_bool(std::string_view text, std::string_view source) {
+    return parse_choice<bool>(text, source,
+                              {{"on", true}, {"true", true}, {"1", true}, {"yes", true},
+                               {"off", false}, {"false", false}, {"0", false}, {"no", false}});
+}
+
+RateLimitAlgorithm parse_algorithm(std::string_view text, std::string_view source) {
+    return parse_choice<RateLimitAlgorithm>(
+        text, source,
+        {{"token-bucket", RateLimitAlgorithm::kTokenBucket},
+         {"sliding-window", RateLimitAlgorithm::kSlidingWindow}});
+}
+
+RateLimitMode parse_mode(std::string_view text, std::string_view source) {
+    return parse_choice<RateLimitMode>(
+        text, source, {{"local", RateLimitMode::kLocal}, {"redis", RateLimitMode::kRedis}});
+}
+
+RedisFailurePolicy parse_failure_policy(std::string_view text, std::string_view source) {
+    return parse_choice<RedisFailurePolicy>(text, source,
+                                            {{"open", RedisFailurePolicy::kFailOpen},
+                                             {"closed", RedisFailurePolicy::kFailClosed}});
 }
 
 /// Parses a non-negative integer within [min, max].
@@ -169,6 +217,36 @@ ServerConfig load_config(int argc, const char* const* argv) {
         config.circuit_failure_threshold = static_cast<unsigned>(parse_bounded(
             threshold, "GATEWAY_CIRCUIT_FAILURE_THRESHOLD", 1, kMaxFailureThreshold));
     }
+    if (const char* enabled = non_empty_env("GATEWAY_RATE_LIMIT")) {
+        config.rate_limit_enabled = parse_bool(enabled, "GATEWAY_RATE_LIMIT");
+    }
+    if (const char* algorithm = non_empty_env("GATEWAY_RATE_LIMIT_ALGORITHM")) {
+        config.rate_limit_algorithm = parse_algorithm(algorithm, "GATEWAY_RATE_LIMIT_ALGORITHM");
+    }
+    if (const char* requests = non_empty_env("GATEWAY_RATE_LIMIT_REQUESTS")) {
+        config.rate_limit_requests =
+            parse_bounded(requests, "GATEWAY_RATE_LIMIT_REQUESTS", 1, kMaxRateLimitRequests);
+    }
+    if (const char* window = non_empty_env("GATEWAY_RATE_LIMIT_WINDOW_MS")) {
+        config.rate_limit_window =
+            std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(parse_bounded(
+                window, "GATEWAY_RATE_LIMIT_WINDOW_MS", 1, kMaxRateLimitWindowMs)));
+    }
+    if (const char* mode = non_empty_env("GATEWAY_RATE_LIMIT_MODE")) {
+        config.rate_limit_mode = parse_mode(mode, "GATEWAY_RATE_LIMIT_MODE");
+    }
+    if (const char* host = non_empty_env("GATEWAY_REDIS_HOST")) {
+        config.redis_host = host;
+    }
+    if (const char* port = non_empty_env("GATEWAY_REDIS_PORT")) {
+        config.redis_port = parse_port(port, "GATEWAY_REDIS_PORT");
+    }
+    if (const char* prefix = non_empty_env("GATEWAY_REDIS_KEY_PREFIX")) {
+        config.redis_key_prefix = prefix;
+    }
+    if (const char* policy = non_empty_env("GATEWAY_REDIS_FAILURE_POLICY")) {
+        config.redis_failure_policy = parse_failure_policy(policy, "GATEWAY_REDIS_FAILURE_POLICY");
+    }
     if (const char* cooldown = non_empty_env("GATEWAY_CIRCUIT_COOLDOWN_MS")) {
         config.circuit_cooldown = std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(
             parse_bounded(cooldown, "GATEWAY_CIRCUIT_COOLDOWN_MS", 0, kMaxCooldownMs)));
@@ -204,6 +282,29 @@ ServerConfig load_config(int argc, const char* const* argv) {
         } else if (arg == "--circuit-failure-threshold") {
             config.circuit_failure_threshold = static_cast<unsigned>(
                 parse_bounded(require_value(argc, argv, ++i, arg), arg, 1, kMaxFailureThreshold));
+        } else if (arg == "--rate-limit") {
+            config.rate_limit_enabled = parse_bool(require_value(argc, argv, ++i, arg), arg);
+        } else if (arg == "--rate-limit-algorithm") {
+            config.rate_limit_algorithm = parse_algorithm(require_value(argc, argv, ++i, arg), arg);
+        } else if (arg == "--rate-limit-requests") {
+            config.rate_limit_requests = parse_bounded(require_value(argc, argv, ++i, arg), arg, 1,
+                                                       kMaxRateLimitRequests);
+        } else if (arg == "--rate-limit-window-ms") {
+            config.rate_limit_window =
+                std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(
+                    parse_bounded(require_value(argc, argv, ++i, arg), arg, 1,
+                                  kMaxRateLimitWindowMs)));
+        } else if (arg == "--rate-limit-mode") {
+            config.rate_limit_mode = parse_mode(require_value(argc, argv, ++i, arg), arg);
+        } else if (arg == "--redis-host") {
+            config.redis_host = require_value(argc, argv, ++i, arg);
+        } else if (arg == "--redis-port") {
+            config.redis_port = parse_port(require_value(argc, argv, ++i, arg), arg);
+        } else if (arg == "--redis-key-prefix") {
+            config.redis_key_prefix = require_value(argc, argv, ++i, arg);
+        } else if (arg == "--redis-failure-policy") {
+            config.redis_failure_policy =
+                parse_failure_policy(require_value(argc, argv, ++i, arg), arg);
         } else if (arg == "--circuit-cooldown-ms") {
             config.circuit_cooldown =
                 std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(

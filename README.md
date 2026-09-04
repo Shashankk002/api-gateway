@@ -2,7 +2,7 @@
 
 A C++20 HTTP API gateway, built up in stages.
 
-**Current stage: 6 — timeouts, bounded retries and circuit breakers.**
+**Current stage: 7 — rate limiting.**
 
 The gateway starts an HTTP listener, answers `GET /health` itself, and resolves
 every other request against a route table that maps a method and path prefix to
@@ -11,8 +11,8 @@ probed in the background; one of the currently healthy ones is picked
 round-robin and the request is forwarded to it, with the backend's response
 returned to the client. A transient failure on a safe method is retried once
 onto another instance, and an instance that keeps failing has its circuit opened
-so it stops receiving traffic until it recovers. Rate limiting and the rest of
-the eventual feature set are not implemented yet.
+so it stops receiving traffic until it recovers. Clients can be rate limited
+per IP, locally or through Redis shared across gateway instances.
 
 ## Requirements
 
@@ -46,7 +46,86 @@ ctest --test-dir build --output-on-failure
 The suite starts real `GatewayServer` instances on OS-assigned ports and drives
 them over HTTP, so it exercises observable behaviour rather than internals.
 
+The Redis integration tests need a live Redis and skip cleanly without one, so
+the default run needs no external infrastructure. To run them:
+
+```sh
+docker run --rm -p 6379:6379 redis:7-alpine
+```
+
+`GATEWAY_REDIS_TEST_HOST` and `GATEWAY_REDIS_TEST_PORT` override the endpoint.
+
 To build without tests, configure with `-DAPI_GATEWAY_BUILD_TESTS=OFF`.
+
+## Rate limiting
+
+Off by default: enabling throttling is an explicit decision, so the gateway
+behaves exactly as before until asked. Turn it on with `--rate-limit on`.
+
+A limited request is answered by the gateway alone with `429`. It never selects
+a backend, never spends retry budget and never touches a circuit breaker —
+throttling runs immediately after routing and before any backend machinery. The
+gateway's own `/health` is answered before routing and is never limited.
+
+```
+429 Too Many Requests
+Content-Type: application/json
+RateLimit-Limit: 100
+RateLimit-Remaining: 0
+Retry-After: 1
+
+{"status":"error","error":"rate_limited","reason":"rate_limit_exceeded","service":"users"}
+```
+
+`RateLimit-Limit` and `RateLimit-Remaining` are also set on allowed responses.
+No reset timestamp is advertised: neither algorithm can state one honestly.
+
+### Client key
+
+Requests are keyed on the peer address the socket reports. `X-Forwarded-For`
+and similar headers are deliberately ignored — without trusted-proxy
+configuration they are client-supplied, and honouring them would let anyone
+move themselves into someone else's bucket. Behind a real proxy this means every
+request keys on the proxy's address, so terminate the proxy hop before the
+gateway or add trusted-proxy handling first.
+
+### Algorithms
+
+Both read the configuration as "`--rate-limit-requests` per
+`--rate-limit-window-ms`".
+
+- **Token bucket** (default) — a burst of that many requests, then a steady
+  refill of the same amount per window. Buckets start full and refill from
+  elapsed time when a request arrives, so there is no timer thread and no
+  request ever sleeps.
+- **Sliding window** — at most that many requests in any trailing window.
+  Timestamps of accepted requests are kept per key and expire as the window
+  moves, so the allowance does not reset in a burst at a fixed boundary.
+
+Local state is split across fixed shards so unrelated clients do not contend on
+one mutex, and idle keys are swept out on later requests so memory stays bounded.
+
+### Distributed mode
+
+`--rate-limit-mode redis` moves state into Redis, so several gateway processes
+share one budget. Every decision is a single `EVALSHA` of a token-bucket Lua
+script: the read, refill, allow/deny and write happen in one Redis-side atomic
+step. A local check followed by a Redis counter would race, so there is none.
+The script takes its clock from `redis.call('TIME')`, so gateway hosts do not
+need synchronised wall clocks.
+
+Keys are `<prefix>:tb:<requests>-<window ms>:<client>`. The algorithm and the
+policy parameters are part of the key, so changing a limit starts fresh buckets
+and unrelated policies never share a counter. Keys carry a TTL, so Redis does
+not accumulate state for clients that stop calling.
+
+**Redis failure policy.** `--redis-failure-policy open` (the default) allows
+requests when Redis cannot be reached: rate limiting is protection, not
+authorization, and losing it should degrade protection rather than availability.
+`closed` rejects instead, favouring protection at the cost of turning a Redis
+outage into an outage for clients. There is no silent fallback to local
+counting, which would quietly break the shared limit; the limiter counts these
+fallbacks instead.
 
 ## Configuration
 
@@ -63,6 +142,15 @@ environment variables, then command-line flags.
 | Max retries     | `1`                  | `GATEWAY_MAX_RETRIES`         | `--max-retries <0-10>`        |
 | Circuit threshold | `5`                | `GATEWAY_CIRCUIT_FAILURE_THRESHOLD` | `--circuit-failure-threshold <1-1000>` |
 | Circuit cooldown | `5000` ms           | `GATEWAY_CIRCUIT_COOLDOWN_MS` | `--circuit-cooldown-ms <0-3600000>` |
+| Rate limiting   | `off`                | `GATEWAY_RATE_LIMIT`          | `--rate-limit on\|off`         |
+| Algorithm       | `token-bucket`       | `GATEWAY_RATE_LIMIT_ALGORITHM` | `--rate-limit-algorithm token-bucket\|sliding-window` |
+| Requests        | `100`                | `GATEWAY_RATE_LIMIT_REQUESTS` | `--rate-limit-requests <1-1000000>` |
+| Window          | `60000` ms           | `GATEWAY_RATE_LIMIT_WINDOW_MS` | `--rate-limit-window-ms <1-3600000>` |
+| Mode            | `local`              | `GATEWAY_RATE_LIMIT_MODE`     | `--rate-limit-mode local\|redis` |
+| Redis host      | `127.0.0.1`          | `GATEWAY_REDIS_HOST`          | `--redis-host <addr>`         |
+| Redis port      | `6379`               | `GATEWAY_REDIS_PORT`          | `--redis-port <1-65535>`      |
+| Redis prefix    | `gateway:ratelimit`  | `GATEWAY_REDIS_KEY_PREFIX`    | `--redis-key-prefix <text>`   |
+| Redis failure   | `open`               | `GATEWAY_REDIS_FAILURE_POLICY` | `--redis-failure-policy open\|closed` |
 
 `--backend` may be repeated; `GATEWAY_BACKENDS` takes a comma-separated list of
 the same `service=host:port` form. A leading `http://` is accepted and ignored.
@@ -340,8 +428,9 @@ tests/                  GoogleTest suite
 ```
 
 `src/circuit_breaker.cpp`, `src/config.cpp`, `src/health.cpp`,
-`src/load_balancer.cpp`, `src/proxy.cpp`, `src/router.cpp` and `src/server.cpp`
-build into the `api_gateway_core` library, which both the
+`src/load_balancer.cpp`, `src/proxy.cpp`, `src/rate_limiter.cpp`,
+`src/redis_rate_limiter.cpp`, `src/router.cpp` and `src/server.cpp` build into
+the `api_gateway_core` library, which both the
 executable and the tests link against — the tests therefore run the same server
 code that ships.
 
@@ -352,6 +441,9 @@ Responsibilities are split so each answers one question:
 - `ServerConfig` — where are that service's instances, and how long may they take?
 - `BackendHealth` / `HealthChecker` — is this instance currently healthy? The
   only component that probes backends, on its own thread.
+- `RateLimiter` — may this client make this request? `TokenBucketLimiter` and
+  `SlidingWindowLimiter` hold local state; `RedisRateLimiter` holds none and
+  defers to Redis. None of them knows anything about HTTP.
 - `CircuitBreaker` — should this instance be given traffic right now, given how
   its recent requests went? Holds no network code.
 - `LoadBalancer` — which eligible instance serves this request? Does no I/O and
@@ -373,5 +465,8 @@ tags, so builds are reproducible without a system-wide install.
 
 - [cpp-httplib](https://github.com/yhirose/cpp-httplib) `v0.18.7` — header-only
   HTTP server (and the client used by the tests).
+- [hiredis](https://github.com/redis/hiredis) `v1.4.1` — minimal C client for
+  Redis. Chosen over a heavier C++ wrapper because the gateway only needs
+  `EVALSHA`/`EVAL`.
 - [GoogleTest](https://github.com/google/googletest) `v1.15.2` — test framework;
   fetched only when `API_GATEWAY_BUILD_TESTS` is on.

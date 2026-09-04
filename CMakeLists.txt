@@ -36,6 +36,8 @@ add_library(api_gateway_core
     src/health.cpp
     src/load_balancer.cpp
     src/proxy.cpp
+    src/rate_limiter.cpp
+    src/redis_rate_limiter.cpp
     src/router.cpp
     src/server.cpp)
 add_library(api_gateway::core ALIAS api_gateway_core)
@@ -44,7 +46,7 @@ target_include_directories(api_gateway_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_link_libraries(api_gateway_core
     PUBLIC httplib::httplib
-    PRIVATE api_gateway_warnings)
+    PRIVATE hiredis::hiredis api_gateway_warnings)
 
 add_executable(api_gateway src/main.cpp)
 set_target_properties(api_gateway PROPERTIES OUTPUT_NAME api-gateway)

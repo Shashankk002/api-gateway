@@ -17,6 +17,18 @@ struct BackendEndpoint {
     friend bool operator==(const BackendEndpoint&, const BackendEndpoint&) = default;
 };
 
+/// Which local algorithm backs rate limiting.
+enum class RateLimitAlgorithm { kTokenBucket, kSlidingWindow };
+
+/// Where rate-limit state lives: this process only, or shared through Redis.
+enum class RateLimitMode { kLocal, kRedis };
+
+/// What to do when Redis cannot be reached for a decision.
+enum class RedisFailurePolicy {
+    kFailOpen,    ///< Allow the request; availability over protection.
+    kFailClosed,  ///< Reject the request; protection over availability.
+};
+
 /// Logical service name -> its backend instances, in configured order.
 /// std::less<> allows string_view lookups.
 using BackendTable = std::map<std::string, std::vector<BackendEndpoint>, std::less<>>;
@@ -36,6 +48,11 @@ struct ServerConfig {
     static constexpr unsigned kDefaultMaxRetries = 1;
     static constexpr unsigned kDefaultCircuitFailureThreshold = 5;
     static constexpr std::chrono::milliseconds kDefaultCircuitCooldown{5000};
+    static constexpr std::uint64_t kDefaultRateLimitRequests = 100;
+    static constexpr std::chrono::milliseconds kDefaultRateLimitWindow{60000};
+    static constexpr const char* kDefaultRedisHost = "127.0.0.1";
+    static constexpr std::uint16_t kDefaultRedisPort = 6379;
+    static constexpr const char* kDefaultRedisKeyPrefix = "gateway:ratelimit";
 
     std::string host{kDefaultHost};
     std::uint16_t port{kDefaultPort};
@@ -63,6 +80,23 @@ struct ServerConfig {
 
     /// How long an open circuit refuses traffic before admitting one probe.
     std::chrono::milliseconds circuit_cooldown{kDefaultCircuitCooldown};
+
+    /// Off by default: enabling throttling is an explicit decision, and leaving
+    /// it off keeps the gateway's behaviour unchanged until it is asked for.
+    bool rate_limit_enabled{false};
+    RateLimitAlgorithm rate_limit_algorithm{RateLimitAlgorithm::kTokenBucket};
+
+    /// "rate_limit_requests per rate_limit_window". The token bucket reads this
+    /// as a capacity of that many with a refill of the same amount per window;
+    /// the sliding window reads it as a ceiling over the trailing window.
+    std::uint64_t rate_limit_requests{kDefaultRateLimitRequests};
+    std::chrono::milliseconds rate_limit_window{kDefaultRateLimitWindow};
+
+    RateLimitMode rate_limit_mode{RateLimitMode::kLocal};
+    std::string redis_host{kDefaultRedisHost};
+    std::uint16_t redis_port{kDefaultRedisPort};
+    std::string redis_key_prefix{kDefaultRedisKeyPrefix};
+    RedisFailurePolicy redis_failure_policy{RedisFailurePolicy::kFailOpen};
 };
 
 /// Builds a ServerConfig from the process environment and command line.
@@ -73,7 +107,10 @@ struct ServerConfig {
 /// GATEWAY_CIRCUIT_FAILURE_THRESHOLD, GATEWAY_CIRCUIT_COOLDOWN_MS), then the
 /// matching `--host`, `--port`, `--backend`, `--backend-timeout-ms`,
 /// `--health-check-interval-ms`, `--max-retries`,
-/// `--circuit-failure-threshold` and `--circuit-cooldown-ms` arguments.
+/// `--circuit-failure-threshold`, `--circuit-cooldown-ms`, `--rate-limit`,
+/// `--rate-limit-algorithm`, `--rate-limit-requests`, `--rate-limit-window-ms`,
+/// `--rate-limit-mode`, `--redis-host`, `--redis-port`, `--redis-key-prefix`
+/// and `--redis-failure-policy` arguments.
 ///
 /// The first backend given from any source replaces the built-in table; further
 /// ones add an instance, so repeating a service name gives it several
