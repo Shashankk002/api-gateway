@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -15,14 +16,23 @@
 #include <vector>
 
 #include "gateway/config.hpp"
+#include "gateway/health.hpp"
+#include "gateway/load_balancer.hpp"
 #include "gateway/router.hpp"
 #include "gateway/server.hpp"
 
 namespace gateway_test {
 
+/// How long a test waits for an expected health transition before failing.
+inline constexpr std::chrono::milliseconds kHealthWaitTimeout{5000};
+
 /// A real HTTP backend on an OS-assigned loopback port. It records every
 /// request it receives so tests can assert on what was forwarded, and its reply
 /// is configurable.
+///
+/// `GET /health` is answered separately from proxied traffic so a test can make
+/// the backend look unhealthy while it keeps serving normal requests, and can
+/// count the probes it received.
 class TestBackend {
 public:
     struct Received {
@@ -48,6 +58,10 @@ public:
                                     httplib::Response& response) {
             record_and_reply(request, response);
         };
+        // Registered before the catch-alls, which httplib matches in order.
+        server_.Get("/health", [this](const httplib::Request&, httplib::Response& response) {
+            reply_to_health_probe(response);
+        });
         // Per-method catch-alls: httplib only reads the body once routing picks
         // a handler, so a pre-routing hook would see an empty body.
         server_.Get(".*", handler);
@@ -100,6 +114,25 @@ public:
         delay_ = delay;
     }
 
+    /// Status this backend answers health probes with. 200 by default; anything
+    /// outside 2xx makes the gateway consider it unhealthy.
+    void set_health_status(int status) {
+        const std::lock_guard<std::mutex> guard(mutex_);
+        health_status_ = status;
+    }
+
+    /// Delays health probes only, so a test can drive the probe timeout without
+    /// slowing proxied traffic.
+    void set_health_delay(std::chrono::milliseconds delay) {
+        const std::lock_guard<std::mutex> guard(mutex_);
+        health_delay_ = delay;
+    }
+
+    [[nodiscard]] std::size_t health_check_count() const {
+        const std::lock_guard<std::mutex> guard(mutex_);
+        return health_checks_;
+    }
+
     [[nodiscard]] std::vector<Received> received() const {
         const std::lock_guard<std::mutex> guard(mutex_);
         return received_;
@@ -111,6 +144,22 @@ public:
     }
 
 private:
+    void reply_to_health_probe(httplib::Response& response) {
+        int status = 0;
+        std::chrono::milliseconds delay{0};
+        {
+            const std::lock_guard<std::mutex> guard(mutex_);
+            ++health_checks_;
+            status = health_status_;
+            delay = health_delay_;
+        }
+        if (delay.count() > 0) {
+            std::this_thread::sleep_for(delay);
+        }
+        response.status = status;
+        response.set_content(R"({"status":"backend"})", "application/json");
+    }
+
     void record_and_reply(const httplib::Request& request, httplib::Response& response) {
         int status = 0;
         std::string body;
@@ -149,6 +198,26 @@ private:
     httplib::Headers extra_headers_;
     std::chrono::milliseconds delay_{0};
     std::vector<Received> received_;
+
+    int health_status_{200};
+    std::chrono::milliseconds health_delay_{0};
+    std::size_t health_checks_{0};
+};
+
+/// A LoadBalancer with the health state and backend table it needs, for tests
+/// that exercise selection without opening a socket. Members are declared in
+/// the order the balancer depends on them.
+class SelectionPool {
+public:
+    explicit SelectionPool(gateway::BackendTable table)
+        : backends(std::move(table)), health(backends), balancer(backends, health) {}
+
+    SelectionPool(const SelectionPool&) = delete;
+    SelectionPool& operator=(const SelectionPool&) = delete;
+
+    gateway::BackendTable backends;
+    gateway::BackendHealth health;
+    gateway::LoadBalancer balancer;
 };
 
 /// Base fixture for integration tests: runs a real GatewayServer on an
@@ -158,11 +227,14 @@ private:
 /// Subclasses override make_router() to choose the route table under test.
 class GatewayServerTestBase : public ::testing::Test {
 protected:
-    /// A loopback config with no backends; the starting point for make_config().
+    /// A loopback config with no backends and no background health checking, so
+    /// a test sees only the behaviour it sets up. Tests that want health checks
+    /// set health_check_interval themselves.
     [[nodiscard]] static gateway::ServerConfig loopback_config() {
         gateway::ServerConfig config;
         config.host = "127.0.0.1";
         config.backends.clear();
+        config.health_check_interval = std::chrono::milliseconds{0};
         return config;
     }
 
@@ -192,6 +264,14 @@ protected:
         if (serve_thread_.joinable()) {
             serve_thread_.join();
         }
+    }
+
+    /// Health state of the running gateway, for waiting on transitions.
+    [[nodiscard]] const gateway::BackendHealth& health() const { return server_->health(); }
+
+    /// Waits for `predicate` to hold, bounded, without polling sleeps.
+    [[nodiscard]] bool wait_for_health(const std::function<bool()>& predicate) const {
+        return server_->health().wait_for(predicate, kHealthWaitTimeout);
     }
 
     httplib::Client make_client() const {

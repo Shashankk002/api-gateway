@@ -2,14 +2,15 @@
 
 A C++20 HTTP API gateway, built up in stages.
 
-**Current stage: 4 — multiple backend instances and round-robin load balancing.**
+**Current stage: 5 — backend health checks.**
 
 The gateway starts an HTTP listener, answers `GET /health` itself, and resolves
 every other request against a route table that maps a method and path prefix to
-a logical service name. A service may have several backend instances; one is
-picked round-robin and the request is forwarded to it, with the backend's
-response returned to the client. Health checking, failover, retries, rate
-limiting and the rest of the eventual feature set are not implemented yet.
+a logical service name. A service may have several backend instances, which are
+probed in the background; one of the currently healthy ones is picked
+round-robin and the request is forwarded to it, with the backend's response
+returned to the client. Failover, retries, rate limiting and the rest of the
+eventual feature set are not implemented yet.
 
 ## Requirements
 
@@ -56,6 +57,7 @@ environment variables, then command-line flags.
 | Port            | `8080`               | `GATEWAY_PORT`                | `--port <1-65535>`            |
 | Backends        | built-in table       | `GATEWAY_BACKENDS`            | `--backend <svc>=<host>:<port>` |
 | Backend timeout | `5000` ms            | `GATEWAY_BACKEND_TIMEOUT_MS`  | `--backend-timeout-ms <ms>`   |
+| Health interval | `5000` ms            | `GATEWAY_HEALTH_CHECK_INTERVAL_MS` | `--health-check-interval-ms <ms>` |
 
 `--backend` may be repeated; `GATEWAY_BACKENDS` takes a comma-separated list of
 the same `service=host:port` form. A leading `http://` is accepted and ignored.
@@ -68,6 +70,9 @@ api-gateway --backend users=127.0.0.1:9001 --backend users=127.0.0.1:9002
 ```sh
 GATEWAY_BACKENDS=users=127.0.0.1:9001,users=127.0.0.1:9002 api-gateway
 ```
+
+The health-check interval accepts `0` to turn health checking off entirely,
+leaving every configured instance eligible; otherwise it is 1–3600000 ms.
 
 `config/gateway.env` holds the defaults in a form that a shell can source.
 
@@ -215,18 +220,49 @@ request 4 -> 127.0.0.1:9001
 ```
 
 Each service advances its own position, so traffic to `orders` never shifts the
-rotation of `users`. Selection is a single atomic increment modulo the instance
-count, so it is O(1) and correct when requests arrive concurrently.
+rotation of `users`. Selection takes an atomic ticket and is correct when
+requests arrive concurrently.
 
-A service that is routed but has no instances answers `502` with reason
-`no_backend_configured`.
+Only instances currently considered healthy take part. With `A` healthy, `B`
+unhealthy and `C` healthy, the rotation becomes `A → C → A → C`, splitting
+evenly rather than doubling up on whoever follows `B`.
 
-**Limitations at this stage.** Selection is blind: the gateway does not check
-whether an instance is healthy, does not remove a failing one from the rotation,
-and does not retry elsewhere. A request that lands on a dead instance gets the
-usual `502`; the next request continues the rotation normally. Instances are
-also equally weighted — there is no weighting, least-connections or session
-affinity.
+A service that is routed but has no instances — or none currently healthy —
+answers `502` with reason `no_backend_configured`.
+
+## Health checks
+
+A background thread probes every configured instance with `GET /health` sent
+straight to that instance. This is the *backend's* health endpoint and has
+nothing to do with the gateway's own `/health`, which is answered by the gateway
+and never depends on backend health.
+
+An instance is healthy when a response arrives with a 2xx status. Connection
+failures, timeouts and any non-2xx status are unhealthy. Response bodies are not
+inspected. Probes reuse the backend timeout, so a dead instance cannot stall a
+sweep, and all instances in a sweep are probed in parallel so one slow instance
+does not hold up the others.
+
+**Startup.** Instances begin healthy. Before its first probe an instance is not
+*known* to be bad, so the gateway serves normally from the first request instead
+of rejecting everything during a startup window. The first sweep runs
+immediately, so a dead instance is normally detected within one probe.
+
+**Recovery.** Unhealthy instances keep being probed. When one starts answering
+2xx again it re-enters the rotation on its own — no restart, no manual step.
+
+Transitions are logged to stderr:
+
+```
+gateway: backend users 127.0.0.1:9002 is unhealthy
+gateway: backend users 127.0.0.1:9002 is healthy
+```
+
+**Limitations at this stage.** Health state is only as fresh as the last sweep,
+so an instance that dies between probes is still selected and that request gets
+the usual `502` — the gateway does not retry elsewhere, and a proxy failure does
+not itself change health state. There is no failover, no circuit breaker, no
+backoff, and no weighting or session affinity.
 
 Outbound requests use a finite connect/read/write timeout, **5000 ms** by
 default (`--backend-timeout-ms`). A refused connection is a `502`; exceeding the
@@ -243,8 +279,8 @@ src/                    Implementation; main.cpp is the entry point only
 tests/                  GoogleTest suite
 ```
 
-`src/config.cpp`, `src/load_balancer.cpp`, `src/proxy.cpp`, `src/router.cpp` and
-`src/server.cpp` build into the `api_gateway_core` library, which both the
+`src/config.cpp`, `src/health.cpp`, `src/load_balancer.cpp`, `src/proxy.cpp`,
+`src/router.cpp` and `src/server.cpp` build into the `api_gateway_core` library, which both the
 executable and the tests link against — the tests therefore run the same server
 code that ships.
 
@@ -253,10 +289,15 @@ Responsibilities are split so each answers one question:
 - `Router` — which logical service does this request belong to? Knows nothing
   about cpp-httplib, so it is unit tested without opening a socket.
 - `ServerConfig` — where are that service's instances, and how long may they take?
-- `LoadBalancer` — which instance serves this request? Does no I/O.
+- `BackendHealth` / `HealthChecker` — is this instance currently healthy? The
+  only component that probes backends, on its own thread.
+- `LoadBalancer` — which healthy instance serves this request? Does no I/O and
+  never probes; it only reads health state.
 - `ReverseProxy` — how do I forward this request to a given instance and return
   the response? Never chooses among instances.
-- `GatewayServer` — coordinates the HTTP lifecycle across the four.
+- `GatewayServer` — coordinates the HTTP lifecycle across the rest, and owns the
+  health checker's lifetime: it starts on construction and is stopped and joined
+  by `stop()` and by the destructor.
 
 The proxy tests start a real backend server in-process and assert on what it
 received, so they exercise the whole client → gateway → backend → client path.

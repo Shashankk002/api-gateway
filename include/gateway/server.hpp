@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "gateway/config.hpp"
+#include "gateway/health.hpp"
 #include "gateway/load_balancer.hpp"
 #include "gateway/proxy.hpp"
 #include "gateway/router.hpp"
@@ -21,12 +22,16 @@ namespace gateway {
 /// It answers `GET /health` itself and delegates every other path to a Router,
 /// which decides whether the request belongs to a logical service, is
 /// method-not-allowed, or is unknown. For a matched request the LoadBalancer
-/// picks one of that service's backend instances and the ReverseProxy forwards
-/// to it. The server holds none of that logic itself.
+/// picks one of that service's healthy backend instances and the ReverseProxy
+/// forwards to it. The server holds none of that logic itself.
 ///
-/// The type owns its httplib::Server, Router, LoadBalancer and ReverseProxy, so
-/// handler state lives on the instance instead of in globals, which lets tests
-/// run servers side by side on their own ports, route tables and backends.
+/// A HealthChecker runs in the background for the object's lifetime, keeping the
+/// health state the LoadBalancer reads up to date. It starts on construction and
+/// is stopped and joined by stop() and by the destructor.
+///
+/// The type owns all of those, so handler state lives on the instance instead of
+/// in globals, which lets tests run servers side by side on their own ports,
+/// route tables and backends.
 ///
 /// Binding and serving are separate steps so that a caller (notably a test) can
 /// learn the port before the blocking serve loop starts.
@@ -62,11 +67,13 @@ public:
     /// server stopped before becoming ready.
     [[nodiscard]] bool wait_until_ready();
 
-    /// Stops the accept loop; safe to call from another thread.
+    /// Stops the accept loop and the background health checker; safe to call
+    /// from another thread, and idempotent.
     void stop();
 
     [[nodiscard]] const ServerConfig& config() const noexcept { return config_; }
     [[nodiscard]] const Router& router() const noexcept { return router_; }
+    [[nodiscard]] const BackendHealth& health() const noexcept { return health_; }
     [[nodiscard]] const LoadBalancer& balancer() const noexcept { return balancer_; }
     [[nodiscard]] const ReverseProxy& proxy() const noexcept { return proxy_; }
 
@@ -77,10 +84,14 @@ private:
     /// selected backend instance when the request matches a route.
     void handle_service_request(const httplib::Request& request, httplib::Response& response) const;
 
+    // Declaration order is also destruction order reversed: health_ outlives
+    // both the balancer that reads it and the checker that writes it.
     ServerConfig config_;
+    BackendHealth health_;
     Router router_;
     LoadBalancer balancer_;
     ReverseProxy proxy_;
+    HealthChecker checker_;
     std::unique_ptr<httplib::Server> http_;
     std::uint16_t bound_port_{0};
 };

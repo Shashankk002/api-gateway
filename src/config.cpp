@@ -45,6 +45,22 @@ std::chrono::milliseconds parse_timeout_ms(std::string_view text, std::string_vi
     return std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(value));
 }
 
+/// Health-check interval: 0 disables checking, otherwise up to an hour. The
+/// upper bound also keeps the value far from any duration overflow.
+std::chrono::milliseconds parse_interval_ms(std::string_view text, std::string_view source) {
+    constexpr unsigned long kMaxIntervalMs = 3600000;
+
+    unsigned long value = 0;
+    const auto* end = text.data() + text.size();
+    const auto result = std::from_chars(text.data(), end, value);
+    if (text.empty() || result.ec != std::errc{} || result.ptr != end || value > kMaxIntervalMs) {
+        throw std::invalid_argument(std::string(source) + ": expected 0 (disabled) or 1-" +
+                                    std::to_string(kMaxIntervalMs) + " milliseconds, got '" +
+                                    std::string(text) + "'");
+    }
+    return std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(value));
+}
+
 /// Parses "<host>:<port>", tolerating a leading "http://".
 BackendEndpoint parse_endpoint(std::string_view text, std::string_view source) {
     constexpr std::string_view kScheme = "http://";
@@ -120,6 +136,10 @@ ServerConfig load_config(int argc, const char* const* argv) {
     if (const char* timeout = non_empty_env("GATEWAY_BACKEND_TIMEOUT_MS")) {
         config.backend_timeout = parse_timeout_ms(timeout, "GATEWAY_BACKEND_TIMEOUT_MS");
     }
+    if (const char* interval = non_empty_env("GATEWAY_HEALTH_CHECK_INTERVAL_MS")) {
+        config.health_check_interval =
+            parse_interval_ms(interval, "GATEWAY_HEALTH_CHECK_INTERVAL_MS");
+    }
     if (const char* backends = non_empty_env("GATEWAY_BACKENDS")) {
         std::string_view remaining = backends;
         while (!remaining.empty()) {
@@ -142,6 +162,9 @@ ServerConfig load_config(int argc, const char* const* argv) {
             add_backend(require_value(argc, argv, ++i, arg), arg);
         } else if (arg == "--backend-timeout-ms") {
             config.backend_timeout = parse_timeout_ms(require_value(argc, argv, ++i, arg), arg);
+        } else if (arg == "--health-check-interval-ms") {
+            config.health_check_interval =
+                parse_interval_ms(require_value(argc, argv, ++i, arg), arg);
         } else {
             throw std::invalid_argument("unknown argument '" + std::string(arg) + "'");
         }

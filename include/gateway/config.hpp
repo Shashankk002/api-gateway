@@ -32,6 +32,7 @@ struct ServerConfig {
     static constexpr std::uint16_t kDefaultPort = 8080;
     static constexpr const char* kDefaultHost = "0.0.0.0";
     static constexpr std::chrono::milliseconds kDefaultBackendTimeout{5000};
+    static constexpr std::chrono::milliseconds kDefaultHealthCheckInterval{5000};
 
     std::string host{kDefaultHost};
     std::uint16_t port{kDefaultPort};
@@ -41,15 +42,21 @@ struct ServerConfig {
     /// list several instances; requests are spread across them round-robin.
     BackendTable backends{default_backends()};
 
-    /// Connect, read and write timeout for outbound backend requests.
+    /// Connect, read and write timeout for outbound backend requests, health
+    /// probes included.
     std::chrono::milliseconds backend_timeout{kDefaultBackendTimeout};
+
+    /// How often each backend instance is probed with GET /health. Zero turns
+    /// health checking off, leaving every configured instance eligible.
+    std::chrono::milliseconds health_check_interval{kDefaultHealthCheckInterval};
 };
 
 /// Builds a ServerConfig from the process environment and command line.
 ///
 /// Precedence, lowest to highest: built-in defaults, environment variables
-/// (GATEWAY_HOST, GATEWAY_PORT, GATEWAY_BACKENDS, GATEWAY_BACKEND_TIMEOUT_MS),
-/// then the matching `--host`, `--port`, `--backend` and `--backend-timeout-ms`
+/// (GATEWAY_HOST, GATEWAY_PORT, GATEWAY_BACKENDS, GATEWAY_BACKEND_TIMEOUT_MS,
+/// GATEWAY_HEALTH_CHECK_INTERVAL_MS), then the matching `--host`, `--port`,
+/// `--backend`, `--backend-timeout-ms` and `--health-check-interval-ms`
 /// arguments.
 ///
 /// The first backend given from any source replaces the built-in table; further

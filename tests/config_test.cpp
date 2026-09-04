@@ -26,6 +26,7 @@ protected:
         ::unsetenv("GATEWAY_PORT");
         ::unsetenv("GATEWAY_BACKENDS");
         ::unsetenv("GATEWAY_BACKEND_TIMEOUT_MS");
+        ::unsetenv("GATEWAY_HEALTH_CHECK_INTERVAL_MS");
     }
 };
 
@@ -170,6 +171,37 @@ TEST_F(ConfigTest, RejectsNonPositiveOrMalformedBackendTimeout) {
     EXPECT_THROW((void)load({"--backend-timeout-ms", "0"}), std::invalid_argument);
     EXPECT_THROW((void)load({"--backend-timeout-ms", "soon"}), std::invalid_argument);
     EXPECT_THROW((void)load({"--backend-timeout-ms"}), std::invalid_argument);
+}
+
+TEST_F(ConfigTest, HealthCheckIntervalDefaultsToTheBuiltInValue) {
+    EXPECT_EQ(load({}).health_check_interval,
+              gateway::ServerConfig::kDefaultHealthCheckInterval);
+    EXPECT_GT(gateway::ServerConfig::kDefaultHealthCheckInterval.count(), 0);
+}
+
+TEST_F(ConfigTest, HealthCheckIntervalIsConfigurable) {
+    EXPECT_EQ(load({"--health-check-interval-ms", "250"}).health_check_interval,
+              std::chrono::milliseconds{250});
+
+    ::setenv("GATEWAY_HEALTH_CHECK_INTERVAL_MS", "750", 1);
+    EXPECT_EQ(load({}).health_check_interval, std::chrono::milliseconds{750});
+    EXPECT_EQ(load({"--health-check-interval-ms", "100"}).health_check_interval,
+              std::chrono::milliseconds{100});
+}
+
+TEST_F(ConfigTest, ZeroHealthCheckIntervalDisablesChecking) {
+    EXPECT_EQ(load({"--health-check-interval-ms", "0"}).health_check_interval,
+              std::chrono::milliseconds{0});
+}
+
+TEST_F(ConfigTest, RejectsMalformedOrUnreasonableHealthCheckInterval) {
+    EXPECT_THROW((void)load({"--health-check-interval-ms", "often"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--health-check-interval-ms", "-1"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--health-check-interval-ms", "3600001"}), std::invalid_argument);
+    // Beyond any integer type the parser could hold.
+    EXPECT_THROW((void)load({"--health-check-interval-ms", "999999999999999999999"}),
+                 std::invalid_argument);
+    EXPECT_THROW((void)load({"--health-check-interval-ms"}), std::invalid_argument);
 }
 
 }  // namespace

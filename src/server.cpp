@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "gateway/health.hpp"
 #include "gateway/load_balancer.hpp"
 #include "gateway/proxy.hpp"
 #include "gateway/router.hpp"
@@ -106,11 +107,14 @@ GatewayServer::GatewayServer(ServerConfig config)
 
 GatewayServer::GatewayServer(ServerConfig config, Router router)
     : config_(std::move(config)),
+      health_(config_.backends),
       router_(std::move(router)),
-      balancer_(config_.backends),
+      balancer_(config_.backends, health_),
       proxy_(config_.backend_timeout),
+      checker_(config_.backends, health_, config_.health_check_interval, config_.backend_timeout),
       http_(std::make_unique<httplib::Server>()) {
     register_routes();
+    checker_.start();
 }
 
 GatewayServer::~GatewayServer() = default;
@@ -243,6 +247,12 @@ bool GatewayServer::run() {
         }
     }
     std::cout << "gateway: backend timeout " << proxy_.timeout().count() << "ms\n";
+    if (config_.health_check_interval.count() > 0) {
+        std::cout << "gateway: health checks every " << config_.health_check_interval.count()
+                  << "ms\n";
+    } else {
+        std::cout << "gateway: health checks disabled\n";
+    }
     // std::endl: flush so the readiness line appears immediately even when
     // stdout is redirected to a file or pipe.
     std::cout << "gateway: listening on " << config_.host << ':' << bound_port_ << std::endl;
@@ -254,6 +264,9 @@ bool GatewayServer::wait_until_ready() {
     return http_->is_running();
 }
 
-void GatewayServer::stop() { http_->stop(); }
+void GatewayServer::stop() {
+    http_->stop();
+    checker_.stop();
+}
 
 }  // namespace gateway

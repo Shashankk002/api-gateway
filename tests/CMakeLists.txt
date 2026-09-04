@@ -2,6 +2,8 @@ include(GoogleTest)
 
 add_executable(api_gateway_tests
     config_test.cpp
+    health_check_integration_test.cpp
+    health_check_test.cpp
     health_endpoint_test.cpp
     load_balancer_test.cpp
     load_balancing_integration_test.cpp
