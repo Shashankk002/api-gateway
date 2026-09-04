@@ -1,0 +1,68 @@
+#include "gateway/config.hpp"
+
+#include <charconv>
+#include <cstdlib>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <system_error>
+
+namespace gateway {
+namespace {
+
+std::uint16_t parse_port(std::string_view text, std::string_view source) {
+    unsigned long value = 0;
+    const auto* begin = text.data();
+    const auto* end = text.data() + text.size();
+    const auto result = std::from_chars(begin, end, value);
+
+    const bool fully_consumed = result.ec == std::errc{} && result.ptr == end;
+    const bool in_range = value >= 1 && value <= std::numeric_limits<std::uint16_t>::max();
+    if (text.empty() || !fully_consumed || !in_range) {
+        throw std::invalid_argument(std::string(source) + ": expected a port in 1-65535, got '" +
+                                    std::string(text) + "'");
+    }
+    return static_cast<std::uint16_t>(value);
+}
+
+/// Returns the value of `name`, or nullopt when it is unset or empty.
+const char* non_empty_env(const char* name) {
+    const char* value = std::getenv(name);
+    return (value != nullptr && *value != '\0') ? value : nullptr;
+}
+
+std::string_view require_value(int argc, const char* const* argv, int index, std::string_view flag) {
+    if (index >= argc) {
+        throw std::invalid_argument(std::string(flag) + " requires a value");
+    }
+    return argv[index];
+}
+
+}  // namespace
+
+ServerConfig load_config(int argc, const char* const* argv) {
+    ServerConfig config{};
+
+    if (const char* host = non_empty_env("GATEWAY_HOST")) {
+        config.host = host;
+    }
+    if (const char* port = non_empty_env("GATEWAY_PORT")) {
+        config.port = parse_port(port, "GATEWAY_PORT");
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+        if (arg == "--port") {
+            config.port = parse_port(require_value(argc, argv, ++i, arg), arg);
+        } else if (arg == "--host") {
+            config.host = require_value(argc, argv, ++i, arg);
+        } else {
+            throw std::invalid_argument("unknown argument '" + std::string(arg) + "'");
+        }
+    }
+
+    return config;
+}
+
+}  // namespace gateway
