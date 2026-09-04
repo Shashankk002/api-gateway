@@ -35,7 +35,7 @@ protected:
 
     gateway::ServerConfig make_config() override {
         auto config = loopback_config();
-        config.backends = {{"users", backend_.endpoint()}};
+        config.backends = {{"users", {backend_.endpoint()}}};
         return config;
     }
 
@@ -232,7 +232,7 @@ protected:
 
     gateway::ServerConfig make_config() override {
         auto config = loopback_config();
-        config.backends = {{"users", closed_endpoint_}};
+        config.backends = {{"users", {closed_endpoint_}}};
         return config;
     }
 
@@ -273,7 +273,7 @@ protected:
 
     gateway::ServerConfig make_config() override {
         auto config = loopback_config();
-        config.backends = {{"users", backend_.endpoint()}};
+        config.backends = {{"users", {backend_.endpoint()}}};
         config.backend_timeout = std::chrono::milliseconds{200};
         return config;
     }

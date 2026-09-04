@@ -35,10 +35,10 @@ protected:
     gateway::ServerConfig make_config() override {
         auto config = loopback_config();
         config.backends = {
-            {"users", users_.endpoint()},
-            {"users-write", users_write_.endpoint()},
-            {"api", api_.endpoint()},
-            {"admin", admin_.endpoint()},
+            {"users", {users_.endpoint()}},
+            {"users-write", {users_write_.endpoint()}},
+            {"api", {api_.endpoint()}},
+            {"admin", {admin_.endpoint()}},
         };
         return config;
     }
@@ -172,7 +172,7 @@ protected:
 
     gateway::ServerConfig make_config() override {
         auto config = loopback_config();
-        config.backends = {{"root", root_.endpoint()}};
+        config.backends = {{"root", {root_.endpoint()}}};
         return config;
     }
 
@@ -206,9 +206,9 @@ protected:
     gateway::ServerConfig make_config() override {
         auto config = loopback_config();
         config.backends = {
-            {"users", users_.endpoint()},
-            {"orders", orders_.endpoint()},
-            {"products", products_.endpoint()},
+            {"users", {users_.endpoint()}},
+            {"orders", {orders_.endpoint()}},
+            {"products", {products_.endpoint()}},
         };
         return config;
     }

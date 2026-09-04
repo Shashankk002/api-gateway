@@ -32,6 +32,7 @@ endif()
 # link the real server rather than a copy of it.
 add_library(api_gateway_core
     src/config.cpp
+    src/load_balancer.cpp
     src/proxy.cpp
     src/router.cpp
     src/server.cpp)

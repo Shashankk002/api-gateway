@@ -5,11 +5,11 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace gateway {
 
-/// Where a logical service lives. Exactly one endpoint per service at this
-/// stage; load balancing across several is a later stage.
+/// One instance of a logical service.
 struct BackendEndpoint {
     std::string host;
     std::uint16_t port{0};
@@ -17,8 +17,9 @@ struct BackendEndpoint {
     friend bool operator==(const BackendEndpoint&, const BackendEndpoint&) = default;
 };
 
-/// Logical service name -> backend. std::less<> allows string_view lookups.
-using BackendTable = std::map<std::string, BackendEndpoint, std::less<>>;
+/// Logical service name -> its backend instances, in configured order.
+/// std::less<> allows string_view lookups.
+using BackendTable = std::map<std::string, std::vector<BackendEndpoint>, std::less<>>;
 
 /// The gateway's built-in backend table, matching default_service_router().
 [[nodiscard]] BackendTable default_backends();
@@ -36,7 +37,8 @@ struct ServerConfig {
     std::uint16_t port{kDefaultPort};
 
     /// The only destinations the gateway will proxy to. Never derived from a
-    /// request, so the gateway cannot be used as an open proxy.
+    /// request, so the gateway cannot be used as an open proxy. A service may
+    /// list several instances; requests are spread across them round-robin.
     BackendTable backends{default_backends()};
 
     /// Connect, read and write timeout for outbound backend requests.
@@ -51,7 +53,8 @@ struct ServerConfig {
 /// arguments.
 ///
 /// The first backend given from any source replaces the built-in table; further
-/// ones add to it or override a single service.
+/// ones add an instance, so repeating a service name gives it several
+/// instances.
 ///
 /// Throws std::invalid_argument if a supplied value is missing or malformed.
 ServerConfig load_config(int argc, const char* const* argv);

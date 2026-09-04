@@ -2,14 +2,14 @@
 
 A C++20 HTTP API gateway, built up in stages.
 
-**Current stage: 3 — reverse proxying.**
+**Current stage: 4 — multiple backend instances and round-robin load balancing.**
 
 The gateway starts an HTTP listener, answers `GET /health` itself, and resolves
 every other request against a route table that maps a method and path prefix to
-a logical service name. A matched request is forwarded to that service's
-configured backend, and the backend's response is returned to the client. Load
-balancing, health checking, retries, rate limiting and the rest of the eventual
-feature set are not implemented yet.
+a logical service name. A service may have several backend instances; one is
+picked round-robin and the request is forwarded to it, with the backend's
+response returned to the client. Health checking, failover, retries, rate
+limiting and the rest of the eventual feature set are not implemented yet.
 
 ## Requirements
 
@@ -59,6 +59,15 @@ environment variables, then command-line flags.
 
 `--backend` may be repeated; `GATEWAY_BACKENDS` takes a comma-separated list of
 the same `service=host:port` form. A leading `http://` is accepted and ignored.
+Repeating a service name adds an instance to it, in the order given:
+
+```sh
+api-gateway --backend users=127.0.0.1:9001 --backend users=127.0.0.1:9002
+```
+
+```sh
+GATEWAY_BACKENDS=users=127.0.0.1:9001,users=127.0.0.1:9002 api-gateway
+```
 
 `config/gateway.env` holds the defaults in a form that a shell can source.
 
@@ -170,17 +179,17 @@ when only the shorter one has the requested method: with `GET /api` and
 ## Proxying
 
 Routing decides *which* service a request belongs to; the backend table decides
-*where* that service is. The built-in table is:
+*where* its instances are. The built-in table is:
 
-| Service    | Backend                 |
-| ---------- | ----------------------- |
-| `users`    | `127.0.0.1:9001`        |
-| `orders`   | `127.0.0.1:9002`        |
-| `products` | `127.0.0.1:9003`        |
+| Service    | Instances                                            |
+| ---------- | ---------------------------------------------------- |
+| `users`    | `127.0.0.1:9001`, `127.0.0.1:9002`, `127.0.0.1:9003` |
+| `orders`   | `127.0.0.1:9010`, `127.0.0.1:9011`                   |
+| `products` | `127.0.0.1:9020`                                     |
 
 Override it with `--backend` or `GATEWAY_BACKENDS` (see Configuration). The
 first backend supplied from any source replaces the built-in table; later ones
-add a service or override one.
+append, so repeating a service name gives it more instances.
 
 A matched request is forwarded with its method, its original request target
 (path and query unchanged — there is no path rewriting), its body and its
@@ -193,6 +202,31 @@ the client as-is, so a backend `201` or `404` reaches the client as `201` or
 
 Only services present in the backend table are ever contacted. The destination
 is never taken from the request, so the gateway cannot be used as an open proxy.
+
+### Load balancing
+
+Requests to a service are spread across its instances in round-robin order:
+
+```
+request 1 -> 127.0.0.1:9001
+request 2 -> 127.0.0.1:9002
+request 3 -> 127.0.0.1:9003
+request 4 -> 127.0.0.1:9001
+```
+
+Each service advances its own position, so traffic to `orders` never shifts the
+rotation of `users`. Selection is a single atomic increment modulo the instance
+count, so it is O(1) and correct when requests arrive concurrently.
+
+A service that is routed but has no instances answers `502` with reason
+`no_backend_configured`.
+
+**Limitations at this stage.** Selection is blind: the gateway does not check
+whether an instance is healthy, does not remove a failing one from the rotation,
+and does not retry elsewhere. A request that lands on a dead instance gets the
+usual `502`; the next request continues the rotation normally. Instances are
+also equally weighted — there is no weighting, least-connections or session
+affinity.
 
 Outbound requests use a finite connect/read/write timeout, **5000 ms** by
 default (`--backend-timeout-ms`). A refused connection is a `502`; exceeding the
@@ -209,17 +243,20 @@ src/                    Implementation; main.cpp is the entry point only
 tests/                  GoogleTest suite
 ```
 
-`src/config.cpp`, `src/proxy.cpp`, `src/router.cpp` and `src/server.cpp` build
-into the `api_gateway_core` library, which both the executable and the tests
-link against — the tests therefore run the same server code that ships.
+`src/config.cpp`, `src/load_balancer.cpp`, `src/proxy.cpp`, `src/router.cpp` and
+`src/server.cpp` build into the `api_gateway_core` library, which both the
+executable and the tests link against — the tests therefore run the same server
+code that ships.
 
 Responsibilities are split so each answers one question:
 
 - `Router` — which logical service does this request belong to? Knows nothing
   about cpp-httplib, so it is unit tested without opening a socket.
-- `ServerConfig` — where is that service, and how long may it take?
-- `ReverseProxy` — how do I forward this request and return the response?
-- `GatewayServer` — coordinates the HTTP lifecycle across the three.
+- `ServerConfig` — where are that service's instances, and how long may they take?
+- `LoadBalancer` — which instance serves this request? Does no I/O.
+- `ReverseProxy` — how do I forward this request to a given instance and return
+  the response? Never chooses among instances.
+- `GatewayServer` — coordinates the HTTP lifecycle across the four.
 
 The proxy tests start a real backend server in-process and assert on what it
 received, so they exercise the whole client → gateway → backend → client path.

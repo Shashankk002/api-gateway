@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "gateway/load_balancer.hpp"
 #include "gateway/proxy.hpp"
 #include "gateway/router.hpp"
 
@@ -106,7 +107,8 @@ GatewayServer::GatewayServer(ServerConfig config)
 GatewayServer::GatewayServer(ServerConfig config, Router router)
     : config_(std::move(config)),
       router_(std::move(router)),
-      proxy_(config_.backends, config_.backend_timeout),
+      balancer_(config_.backends),
+      proxy_(config_.backend_timeout),
       http_(std::make_unique<httplib::Server>()) {
     register_routes();
 }
@@ -120,12 +122,14 @@ void GatewayServer::handle_service_request(const httplib::Request& request,
     switch (match.status) {
         case MatchStatus::kMatched: {
             const std::string& service = match.route->service;
-            switch (proxy_.forward(service, request, response)) {
+            const BackendEndpoint* backend = balancer_.select(service);
+            if (backend == nullptr) {
+                respond_gateway_error(response, httplib::StatusCode::BadGateway_502, "bad_gateway",
+                                      "no_backend_configured", service);
+                return;
+            }
+            switch (proxy_.forward(*backend, request, response)) {
                 case ProxyStatus::kForwarded:
-                    return;
-                case ProxyStatus::kUnknownService:
-                    respond_gateway_error(response, httplib::StatusCode::BadGateway_502,
-                                          "bad_gateway", "no_backend_configured", service);
                     return;
                 case ProxyStatus::kBackendUnreachable:
                     respond_gateway_error(response, httplib::StatusCode::BadGateway_502,
@@ -232,9 +236,11 @@ bool GatewayServer::run() {
         std::cout << "gateway: route " << route.method << ' ' << route.path_prefix << " -> "
                   << route.service << '\n';
     }
-    for (const auto& [service, backend] : proxy_.backends()) {
-        std::cout << "gateway: backend " << service << " -> " << backend.host << ':'
-                  << backend.port << '\n';
+    for (const auto& [service, instances] : balancer_.backends()) {
+        for (const BackendEndpoint& instance : instances) {
+            std::cout << "gateway: backend " << service << " -> " << instance.host << ':'
+                      << instance.port << '\n';
+        }
     }
     std::cout << "gateway: backend timeout " << proxy_.timeout().count() << "ms\n";
     // std::endl: flush so the readiness line appears immediately even when

@@ -88,9 +88,11 @@ std::string_view require_value(int argc, const char* const* argv, int index, std
 
 BackendTable default_backends() {
     return {
-        {"users", BackendEndpoint{"127.0.0.1", 9001}},
-        {"orders", BackendEndpoint{"127.0.0.1", 9002}},
-        {"products", BackendEndpoint{"127.0.0.1", 9003}},
+        {"users",
+         {BackendEndpoint{"127.0.0.1", 9001}, BackendEndpoint{"127.0.0.1", 9002},
+          BackendEndpoint{"127.0.0.1", 9003}}},
+        {"orders", {BackendEndpoint{"127.0.0.1", 9010}, BackendEndpoint{"127.0.0.1", 9011}}},
+        {"products", {BackendEndpoint{"127.0.0.1", 9020}}},
     };
 }
 
@@ -98,7 +100,7 @@ ServerConfig load_config(int argc, const char* const* argv) {
     ServerConfig config{};
 
     // The first backend supplied from any source replaces the built-in table;
-    // later ones add to it, so a caller can opt out of the defaults entirely.
+    // later ones append, so repeating a service name adds instances to it.
     bool backends_replaced = false;
     const auto add_backend = [&config, &backends_replaced](std::string_view spec,
                                                            std::string_view source) {
@@ -106,7 +108,7 @@ ServerConfig load_config(int argc, const char* const* argv) {
             config.backends.clear();
         }
         auto [service, endpoint] = parse_backend(spec, source);
-        config.backends.insert_or_assign(std::move(service), std::move(endpoint));
+        config.backends[std::move(service)].push_back(std::move(endpoint));
     };
 
     if (const char* host = non_empty_env("GATEWAY_HOST")) {

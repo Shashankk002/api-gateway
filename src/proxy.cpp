@@ -6,7 +6,7 @@
 #include <cctype>
 #include <span>
 #include <string>
-#include <utility>
+#include <string_view>
 
 namespace gateway {
 namespace {
@@ -66,17 +66,11 @@ ProxyStatus classify(httplib::Error error) {
 
 }  // namespace
 
-ReverseProxy::ReverseProxy(BackendTable backends, std::chrono::milliseconds timeout)
-    : backends_(std::move(backends)), timeout_(timeout) {}
+ReverseProxy::ReverseProxy(std::chrono::milliseconds timeout) : timeout_(timeout) {}
 
-ProxyStatus ReverseProxy::forward(std::string_view service, const httplib::Request& request,
+ProxyStatus ReverseProxy::forward(const BackendEndpoint& backend, const httplib::Request& request,
                                   httplib::Response& response) const {
-    const auto backend = backends_.find(service);
-    if (backend == backends_.end()) {
-        return ProxyStatus::kUnknownService;
-    }
-
-    httplib::Client client(backend->second.host, backend->second.port);
+    httplib::Client client(backend.host, backend.port);
     client.set_connection_timeout(timeout_);
     client.set_read_timeout(timeout_);
     client.set_write_timeout(timeout_);

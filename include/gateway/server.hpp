@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "gateway/config.hpp"
+#include "gateway/load_balancer.hpp"
 #include "gateway/proxy.hpp"
 #include "gateway/router.hpp"
 
@@ -19,13 +20,13 @@ namespace gateway {
 ///
 /// It answers `GET /health` itself and delegates every other path to a Router,
 /// which decides whether the request belongs to a logical service, is
-/// method-not-allowed, or is unknown. A matched request is then handed to the
-/// ReverseProxy, which forwards it to that service's configured backend. The
-/// server holds neither route-matching nor forwarding logic of its own.
+/// method-not-allowed, or is unknown. For a matched request the LoadBalancer
+/// picks one of that service's backend instances and the ReverseProxy forwards
+/// to it. The server holds none of that logic itself.
 ///
-/// The type owns its httplib::Server, Router and ReverseProxy, so handler state
-/// lives on the instance instead of in globals, which lets tests run servers
-/// side by side on their own ports, route tables and backends.
+/// The type owns its httplib::Server, Router, LoadBalancer and ReverseProxy, so
+/// handler state lives on the instance instead of in globals, which lets tests
+/// run servers side by side on their own ports, route tables and backends.
 ///
 /// Binding and serving are separate steps so that a caller (notably a test) can
 /// learn the port before the blocking serve loop starts.
@@ -66,17 +67,19 @@ public:
 
     [[nodiscard]] const ServerConfig& config() const noexcept { return config_; }
     [[nodiscard]] const Router& router() const noexcept { return router_; }
+    [[nodiscard]] const LoadBalancer& balancer() const noexcept { return balancer_; }
     [[nodiscard]] const ReverseProxy& proxy() const noexcept { return proxy_; }
 
 private:
     void register_routes();
 
-    /// Turns the Router's decision for `request` into a response, proxying to
-    /// the selected service's backend when the request matches a route.
+    /// Turns the Router's decision for `request` into a response, proxying to a
+    /// selected backend instance when the request matches a route.
     void handle_service_request(const httplib::Request& request, httplib::Response& response) const;
 
     ServerConfig config_;
     Router router_;
+    LoadBalancer balancer_;
     ReverseProxy proxy_;
     std::unique_ptr<httplib::Server> http_;
     std::uint16_t bound_port_{0};

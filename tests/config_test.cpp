@@ -83,14 +83,18 @@ TEST_F(ConfigTest, DefaultsToTheBuiltInBackendTable) {
 
     EXPECT_EQ(config.backends, gateway::default_backends());
     EXPECT_EQ(config.backend_timeout, gateway::ServerConfig::kDefaultBackendTimeout);
+    // At least one built-in service must be multi-instance for the default
+    // deployment to exercise load balancing.
+    EXPECT_GT(config.backends.at("users").size(), 1U);
 }
 
 TEST_F(ConfigTest, FirstBackendFlagReplacesTheBuiltInTable) {
     const auto config = load({"--backend", "users=10.0.0.1:9001"});
 
     ASSERT_EQ(config.backends.size(), 1U);
-    EXPECT_EQ(config.backends.at("users").host, "10.0.0.1");
-    EXPECT_EQ(config.backends.at("users").port, 9001);
+    ASSERT_EQ(config.backends.at("users").size(), 1U);
+    EXPECT_EQ(config.backends.at("users").front().host, "10.0.0.1");
+    EXPECT_EQ(config.backends.at("users").front().port, 9001);
 }
 
 TEST_F(ConfigTest, FurtherBackendFlagsAddToTheTable) {
@@ -98,33 +102,50 @@ TEST_F(ConfigTest, FurtherBackendFlagsAddToTheTable) {
         load({"--backend", "users=10.0.0.1:9001", "--backend", "orders=10.0.0.2:9002"});
 
     ASSERT_EQ(config.backends.size(), 2U);
-    EXPECT_EQ(config.backends.at("orders").host, "10.0.0.2");
+    EXPECT_EQ(config.backends.at("orders").front().host, "10.0.0.2");
+}
+
+TEST_F(ConfigTest, RepeatingAServiceAddsInstancesInOrder) {
+    const auto config = load({"--backend", "users=127.0.0.1:9001", "--backend",
+                              "users=127.0.0.1:9002", "--backend", "users=127.0.0.1:9003"});
+
+    ASSERT_EQ(config.backends.size(), 1U);
+    const auto& instances = config.backends.at("users");
+    ASSERT_EQ(instances.size(), 3U);
+    EXPECT_EQ(instances[0].port, 9001);
+    EXPECT_EQ(instances[1].port, 9002);
+    EXPECT_EQ(instances[2].port, 9003);
 }
 
 TEST_F(ConfigTest, BackendAcceptsAnHttpUrlForm) {
     const auto config = load({"--backend", "users=http://127.0.0.1:9001/"});
 
-    EXPECT_EQ(config.backends.at("users").host, "127.0.0.1");
-    EXPECT_EQ(config.backends.at("users").port, 9001);
+    EXPECT_EQ(config.backends.at("users").front().host, "127.0.0.1");
+    EXPECT_EQ(config.backends.at("users").front().port, 9001);
 }
 
 TEST_F(ConfigTest, BackendsEnvironmentVariableIsCommaSeparated) {
-    ::setenv("GATEWAY_BACKENDS", "users=127.0.0.1:9001,orders=127.0.0.1:9002", 1);
+    ::setenv("GATEWAY_BACKENDS", "users=127.0.0.1:9001,users=127.0.0.1:9002,orders=127.0.0.1:9010",
+             1);
 
     const auto config = load({});
 
     ASSERT_EQ(config.backends.size(), 2U);
-    EXPECT_EQ(config.backends.at("users").port, 9001);
-    EXPECT_EQ(config.backends.at("orders").port, 9002);
+    ASSERT_EQ(config.backends.at("users").size(), 2U);
+    EXPECT_EQ(config.backends.at("users")[0].port, 9001);
+    EXPECT_EQ(config.backends.at("users")[1].port, 9002);
+    EXPECT_EQ(config.backends.at("orders").front().port, 9010);
 }
 
-TEST_F(ConfigTest, BackendFlagOverridesTheSameServiceFromTheEnvironment) {
+TEST_F(ConfigTest, BackendFlagsAddToInstancesFromTheEnvironment) {
     ::setenv("GATEWAY_BACKENDS", "users=127.0.0.1:9001", 1);
 
-    const auto config = load({"--backend", "users=127.0.0.1:9999"});
+    const auto config = load({"--backend", "users=127.0.0.1:9002"});
 
     ASSERT_EQ(config.backends.size(), 1U);
-    EXPECT_EQ(config.backends.at("users").port, 9999);
+    ASSERT_EQ(config.backends.at("users").size(), 2U);
+    EXPECT_EQ(config.backends.at("users")[0].port, 9001);
+    EXPECT_EQ(config.backends.at("users")[1].port, 9002);
 }
 
 TEST_F(ConfigTest, RejectsMalformedBackendDefinitions) {
