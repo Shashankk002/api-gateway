@@ -97,6 +97,10 @@ struct ServerConfig {
     std::uint16_t redis_port{kDefaultRedisPort};
     std::string redis_key_prefix{kDefaultRedisKeyPrefix};
     RedisFailurePolicy redis_failure_policy{RedisFailurePolicy::kFailOpen};
+
+    /// Serve Prometheus metrics on /metrics. On by default: instrumentation is
+    /// cheap and an unobservable gateway is hard to operate.
+    bool metrics_enabled{true};
 };
 
 /// Builds a ServerConfig from the process environment and command line.
@@ -110,7 +114,7 @@ struct ServerConfig {
 /// `--circuit-failure-threshold`, `--circuit-cooldown-ms`, `--rate-limit`,
 /// `--rate-limit-algorithm`, `--rate-limit-requests`, `--rate-limit-window-ms`,
 /// `--rate-limit-mode`, `--redis-host`, `--redis-port`, `--redis-key-prefix`
-/// and `--redis-failure-policy` arguments.
+/// `--redis-failure-policy` and `--metrics` arguments.
 ///
 /// The first backend given from any source replaces the built-in table; further
 /// ones add an instance, so repeating a service name gives it several

@@ -18,6 +18,8 @@
 
 namespace gateway {
 
+class MetricsRegistry;
+
 /// Current health of every configured backend instance, keyed by service and by
 /// the instance's position in that service's configured list.
 ///
@@ -68,9 +70,11 @@ private:
 /// path ever waits for a probe.
 class HealthChecker {
 public:
-    /// `health` must outlive this object.
+    /// `health` must outlive this object. `metrics`, when given, records health
+    /// transitions and must outlive this object too.
     HealthChecker(BackendTable backends, BackendHealth& health,
-                  std::chrono::milliseconds interval, std::chrono::milliseconds timeout);
+                  std::chrono::milliseconds interval, std::chrono::milliseconds timeout,
+                  MetricsRegistry* metrics = nullptr);
     ~HealthChecker();
 
     HealthChecker(const HealthChecker&) = delete;
@@ -96,6 +100,7 @@ private:
 
     BackendTable backends_;
     BackendHealth& health_;
+    MetricsRegistry* metrics_;
     std::chrono::milliseconds interval_;
     std::chrono::milliseconds timeout_;
 

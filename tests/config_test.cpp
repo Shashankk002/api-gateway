@@ -39,6 +39,7 @@ protected:
         ::unsetenv("GATEWAY_REDIS_PORT");
         ::unsetenv("GATEWAY_REDIS_KEY_PREFIX");
         ::unsetenv("GATEWAY_REDIS_FAILURE_POLICY");
+        ::unsetenv("GATEWAY_METRICS");
     }
 };
 
@@ -309,6 +310,20 @@ TEST_F(ConfigTest, RateLimitSettingsAreConfigurableByEnvironment) {
 
     // Flags still win over the environment.
     EXPECT_FALSE(load({"--rate-limit", "off"}).rate_limit_enabled);
+}
+
+TEST_F(ConfigTest, MetricsAreEnabledByDefaultAndCanBeTurnedOff) {
+    EXPECT_TRUE(load({}).metrics_enabled) << "an unobservable gateway is hard to operate";
+    EXPECT_FALSE(load({"--metrics", "off"}).metrics_enabled);
+
+    ::setenv("GATEWAY_METRICS", "false", 1);
+    EXPECT_FALSE(load({}).metrics_enabled);
+    EXPECT_TRUE(load({"--metrics", "on"}).metrics_enabled) << "flags win over the environment";
+}
+
+TEST_F(ConfigTest, RejectsInvalidMetricsSetting) {
+    EXPECT_THROW((void)load({"--metrics", "sometimes"}), std::invalid_argument);
+    EXPECT_THROW((void)load({"--metrics"}), std::invalid_argument);
 }
 
 TEST_F(ConfigTest, RejectsInvalidRateLimitSettings) {

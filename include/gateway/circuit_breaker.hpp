@@ -41,7 +41,10 @@ public:
 
     /// Counts a transient failure. Reaching the threshold from CLOSED opens the
     /// breaker; any failure in HALF_OPEN reopens it and restarts the cooldown.
-    void record_failure();
+    /// Returns true when this call is what moved the breaker into OPEN, so a
+    /// caller can count real transitions rather than every failure. The return
+    /// is advisory; callers that only need the state change may ignore it.
+    bool record_failure();
 
     /// Lock-free hint for backend selection: true only while OPEN and still
     /// cooling down. HALF_OPEN stays selectable so a probe can get through,

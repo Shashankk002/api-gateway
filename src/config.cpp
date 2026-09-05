@@ -244,6 +244,9 @@ ServerConfig load_config(int argc, const char* const* argv) {
     if (const char* prefix = non_empty_env("GATEWAY_REDIS_KEY_PREFIX")) {
         config.redis_key_prefix = prefix;
     }
+    if (const char* metrics = non_empty_env("GATEWAY_METRICS")) {
+        config.metrics_enabled = parse_bool(metrics, "GATEWAY_METRICS");
+    }
     if (const char* policy = non_empty_env("GATEWAY_REDIS_FAILURE_POLICY")) {
         config.redis_failure_policy = parse_failure_policy(policy, "GATEWAY_REDIS_FAILURE_POLICY");
     }
@@ -302,6 +305,8 @@ ServerConfig load_config(int argc, const char* const* argv) {
             config.redis_port = parse_port(require_value(argc, argv, ++i, arg), arg);
         } else if (arg == "--redis-key-prefix") {
             config.redis_key_prefix = require_value(argc, argv, ++i, arg);
+        } else if (arg == "--metrics") {
+            config.metrics_enabled = parse_bool(require_value(argc, argv, ++i, arg), arg);
         } else if (arg == "--redis-failure-policy") {
             config.redis_failure_policy =
                 parse_failure_policy(require_value(argc, argv, ++i, arg), arg);

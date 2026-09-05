@@ -7,6 +7,7 @@
 #include "gateway/config.hpp"
 #include "gateway/health.hpp"
 #include "gateway/load_balancer.hpp"
+#include "gateway/metrics.hpp"
 #include "gateway/middleware.hpp"
 #include "gateway/proxy.hpp"
 #include "gateway/rate_limiter.hpp"
@@ -89,6 +90,10 @@ public:
     [[nodiscard]] const BackendHealth& health() const noexcept { return health_; }
     [[nodiscard]] const CircuitBreakers& breakers() const noexcept { return breakers_; }
 
+    /// Instrumentation for this server. Always present; the configuration only
+    /// controls whether /metrics is served.
+    [[nodiscard]] MetricsRegistry& metrics() const noexcept { return metrics_; }
+
     /// The middleware wrapped around every request.
     [[nodiscard]] const Pipeline& pipeline() const noexcept { return pipeline_; }
 
@@ -121,6 +126,9 @@ private:
     // Declaration order is also destruction order reversed: health_ outlives
     // both the balancer that reads it and the checker that writes it.
     ServerConfig config_;
+    // Recording a metric does not change the server's configuration, so the
+    // const request handlers may still update it.
+    mutable MetricsRegistry metrics_;
     Pipeline pipeline_;
     std::unique_ptr<RateLimiter> limiter_;
     BackendHealth health_;

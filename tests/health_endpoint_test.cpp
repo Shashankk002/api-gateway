@@ -53,13 +53,25 @@ TEST_F(GatewayServerTest, UnsupportedMethodOnHealthReturns404) {
     EXPECT_EQ(response->status, 404);
 }
 
-TEST_F(GatewayServerTest, NoGatewayRoutesBeyondHealthAreExposed) {
+TEST_F(GatewayServerTest, NoUnexpectedGatewayRoutesAreExposed) {
     auto client = make_client();
-    for (const char* path : {"/", "/metrics", "/routes", "/admin"}) {
+    // /metrics moved out of this list in Stage 9, where it became a deliberate
+    // gateway-owned endpoint; it is asserted separately below.
+    for (const char* path : {"/", "/routes", "/admin"}) {
         const auto response = client.Get(path);
         ASSERT_TRUE(response) << "request to " << path << " failed";
         EXPECT_EQ(response->status, 404) << "unexpected route exposed: " << path;
     }
+}
+
+TEST_F(GatewayServerTest, MetricsEndpointIsGatewayOwned) {
+    auto client = make_client();
+    const auto response = client.Get("/metrics");
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 200);
+    EXPECT_NE(response->get_header_value("Content-Type").find("text/plain"), std::string::npos)
+        << response->get_header_value("Content-Type");
 }
 
 }  // namespace

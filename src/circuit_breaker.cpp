@@ -47,21 +47,23 @@ void CircuitBreaker::record_success() {
     state_.store(CircuitState::kClosed, std::memory_order_relaxed);
 }
 
-void CircuitBreaker::record_failure() {
+bool CircuitBreaker::record_failure() {
     const std::lock_guard<std::mutex> guard(mutex_);
     const CircuitState current = state_.load(std::memory_order_relaxed);
     probe_in_flight_ = false;
 
     if (current == CircuitState::kHalfOpen) {
         open_locked();
-        return;
+        return true;
     }
     if (current == CircuitState::kOpen) {
-        return;  // Already open; the cooldown is already running.
+        return false;  // Already open; the cooldown is already running.
     }
     if (++failures_ >= threshold_) {
         open_locked();
+        return true;
     }
+    return false;
 }
 
 void CircuitBreaker::open_locked() {

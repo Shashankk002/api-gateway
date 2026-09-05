@@ -2,6 +2,8 @@
 
 #include <httplib.h>
 
+#include "gateway/metrics.hpp"
+
 #include <iostream>
 #include <string>
 #include <utility>
@@ -65,8 +67,13 @@ bool BackendHealth::wait_for(const std::function<bool()>& predicate,
 }
 
 HealthChecker::HealthChecker(BackendTable backends, BackendHealth& health,
-                             std::chrono::milliseconds interval, std::chrono::milliseconds timeout)
-    : backends_(std::move(backends)), health_(health), interval_(interval), timeout_(timeout) {}
+                             std::chrono::milliseconds interval, std::chrono::milliseconds timeout,
+                             MetricsRegistry* metrics)
+    : backends_(std::move(backends)),
+      health_(health),
+      metrics_(metrics),
+      interval_(interval),
+      timeout_(timeout) {}
 
 HealthChecker::~HealthChecker() { stop(); }
 
@@ -140,8 +147,17 @@ void HealthChecker::sweep() {
         probe_thread.join();
     }
 
-    // Logged here rather than in the probes so only this thread writes to cerr.
+    // Logged and counted here rather than in the probes, so only this thread
+    // writes to cerr and the registry sees one update per transition.
     for (const Transition& transition : transitions) {
+        if (metrics_ != nullptr) {
+            const std::vector<std::string_view> labels{*transition.service};
+            if (transition.healthy) {
+                metrics_->health_recoveries.increment(labels);
+            } else {
+                metrics_->health_failures.increment(labels);
+            }
+        }
         std::cerr << "gateway: backend " + *transition.service + " " +
                          transition.instance->host + ":" +
                          std::to_string(transition.instance->port) +

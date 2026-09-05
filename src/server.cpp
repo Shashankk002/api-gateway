@@ -11,6 +11,7 @@
 
 #include "gateway/circuit_breaker.hpp"
 #include "gateway/health.hpp"
+#include "gateway/metrics.hpp"
 #include "gateway/middleware.hpp"
 #include "gateway/rate_limiter.hpp"
 #include "gateway/redis_rate_limiter.hpp"
@@ -26,6 +27,7 @@ constexpr const char* kJsonContentType = "application/json";
 // Owned by the gateway itself: never offered to the Router, so no route table
 // can shadow or take over the health endpoint.
 constexpr const char* kHealthPath = "/health";
+constexpr const char* kMetricsPath = "/metrics";
 
 // Matched by httplib as a regex, so it covers every path. Registered after the
 // gateway's own endpoints, which therefore win.
@@ -169,17 +171,20 @@ GatewayServer::GatewayServer(ServerConfig config)
 GatewayServer::GatewayServer(ServerConfig config, Router router,
                              std::shared_ptr<LogSink> log_sink)
     : config_(std::move(config)),
+      metrics_(config_.backends),
       limiter_(make_rate_limiter(config_)),
       health_(config_.backends),
       breakers_(config_.backends, config_.circuit_failure_threshold, config_.circuit_cooldown),
       router_(std::move(router)),
       balancer_(config_.backends, health_, breakers_),
       proxy_(config_.backend_timeout),
-      checker_(config_.backends, health_, config_.health_check_interval, config_.backend_timeout),
+      checker_(config_.backends, health_, config_.health_check_interval, config_.backend_timeout,
+               &metrics_),
       http_(std::make_unique<httplib::Server>()) {
     // Outermost first: the id exists before anything logs it, and logging sees
     // whatever status the rest of the pipeline finally settles on.
     pipeline_.use(std::make_unique<RequestIdMiddleware>());
+    pipeline_.use(std::make_unique<MetricsMiddleware>(metrics_, kMetricsPath));
     pipeline_.use(std::make_unique<LoggingMiddleware>(
         log_sink != nullptr ? std::move(log_sink) : std::make_shared<StderrLogSink>()));
 
@@ -213,6 +218,7 @@ void GatewayServer::handle_service_request(RequestContext& context) const {
             const RateLimitDecision decision =
                 limiter_->acquire(context.client_key, RateLimiter::Clock::now());
             if (!decision.allowed) {
+                metrics_.rate_limited.increment();
                 respond_gateway_error(response, httplib::StatusCode::TooManyRequests_429,
                                       "rate_limited", "rate_limit_exceeded",
                                       match.route->service);
@@ -271,18 +277,41 @@ void GatewayServer::dispatch_to_service(const std::string& service,
             continue;
         }
 
+        const std::vector<std::string_view> service_label{service};
+        metrics_.backend_requests.increment(service_label);
+        if (forwards > 0) {
+            // Everything past the first attempt is a retry.
+            metrics_.retry_attempts.increment();
+        }
+
         httplib::Response attempt;
+        const auto attempt_started = std::chrono::steady_clock::now();
         const ProxyStatus status = proxy_.forward(*selection.endpoint, request, attempt);
+        metrics_.backend_duration.observe(
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - attempt_started)
+                .count());
+
         const bool transient = is_transient_failure(status, attempt.status);
+        if (transient) {
+            metrics_.backend_failures.increment(service_label);
+            if (status == ProxyStatus::kBackendTimeout) {
+                metrics_.backend_timeouts.increment(service_label);
+            }
+        }
         if (breaker != nullptr) {
             if (transient) {
-                breaker->record_failure();
+                if (breaker->record_failure()) {
+                    metrics_.circuit_opens.increment(service_label);
+                }
             } else {
                 breaker->record_success();
             }
         }
 
         ++forwards;
+        if (forwards == 2) {
+            metrics_.retried_requests.increment();
+        }
         if (!transient) {
             apply_attempt(attempt, response);
             return;
@@ -309,6 +338,7 @@ void GatewayServer::dispatch_to_service(const std::string& service,
         };
 
         if (refused_by_circuit || circuit_is_blocking()) {
+            metrics_.circuit_rejected.increment({service});
             respond_gateway_error(response, httplib::StatusCode::ServiceUnavailable_503,
                                   "service_unavailable", "circuit_open", service);
         } else {
@@ -352,13 +382,25 @@ void GatewayServer::register_routes() {
         });
     });
 
+    if (config_.metrics_enabled) {
+        // Gateway-owned like /health: never routed, rate limited or proxied.
+        http_->Get(kMetricsPath,
+                   [this](const httplib::Request& request, httplib::Response& response) {
+                       run_pipeline(request, response, [this](RequestContext& context) {
+                           context.response.set_content(metrics_.render(),
+                                                        MetricsRegistry::kContentType);
+                       });
+                   });
+    }
+
     // Per-method catch-alls rather than a pre-routing handler: httplib reads the
     // request body only after routing, and the proxy needs it.
     const auto handler = [this](const httplib::Request& request, httplib::Response& response) {
         run_pipeline(request, response, [this](RequestContext& context) {
-            if (context.request.path == kHealthPath) {
+            if (context.request.path == kHealthPath ||
+                (config_.metrics_enabled && context.request.path == kMetricsPath)) {
                 // Gateway-owned. GET is served above; no other method is offered
-                // to the router, so /health can never reach a backend.
+                // to the router, so these can never reach a backend.
                 context.response.status = httplib::StatusCode::NotFound_404;
                 context.response.set_content(kNotFoundBody, kJsonContentType);
                 return;

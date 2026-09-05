@@ -19,6 +19,7 @@
 #include "gateway/config.hpp"
 #include "gateway/health.hpp"
 #include "gateway/load_balancer.hpp"
+#include "gateway/metrics.hpp"
 #include "gateway/middleware.hpp"
 #include "gateway/rate_limiter.hpp"
 #include "gateway/router.hpp"
@@ -294,6 +295,9 @@ protected:
 
     /// The running gateway's rate limiter, or nullptr when disabled.
     [[nodiscard]] gateway::RateLimiter* rate_limiter() const { return server_->rate_limiter(); }
+
+    /// Instrumentation of the running gateway.
+    [[nodiscard]] gateway::MetricsRegistry& metrics() const { return server_->metrics(); }
 
     /// Access-log lines this gateway has written.
     [[nodiscard]] gateway::CapturingLogSink& log_sink() const { return *log_sink_; }

@@ -2,7 +2,7 @@
 
 A C++20 HTTP API gateway, built up in stages.
 
-**Current stage: 8 — middleware and request pipeline.**
+**Current stage: 9 — observability and metrics.**
 
 The gateway starts an HTTP listener, answers `GET /health` itself, and resolves
 every other request against a route table that maps a method and path prefix to
@@ -14,7 +14,7 @@ onto another instance, and an instance that keeps failing has its circuit opened
 so it stops receiving traffic until it recovers. Clients can be rate limited
 per IP, locally or through Redis shared across gateway instances. Every request
 runs through a small middleware pipeline that gives it a correlation id and logs
-its outcome.
+its outcome, and the gateway exposes Prometheus metrics on `/metrics`.
 
 ## Requirements
 
@@ -65,8 +65,9 @@ Cross-cutting concerns live in a small middleware pipeline rather than
 accumulating inside `GatewayServer`:
 
 ```
-Request ID -> Logging -> gateway dispatch (routing, rate limiting,
-                          selection, circuit breakers, retries, proxying)
+Request ID -> Metrics -> Logging -> gateway dispatch (routing, rate limiting,
+                                     selection, circuit breakers, retries,
+                                     proxying)
 ```
 
 A middleware runs before `next`, may skip calling it to end the request early,
@@ -111,6 +112,77 @@ Successes and failures alike, including requests that ended in an exception.
 Headers and bodies are never touched, so credentials cannot leak through it, and
 the target is truncated at 256 characters. Output goes through a `LogSink`, so
 tests capture lines instead of asserting on stderr.
+
+## Metrics
+
+`GET /metrics` serves Prometheus text exposition (format `0.0.4`). Like
+`/health` it is gateway-owned: never routed, rate limited, retried or proxied.
+On by default; `--metrics off` removes the endpoint.
+
+```
+# HELP gateway_requests_total Client requests handled, by method and final status.
+# TYPE gateway_requests_total counter
+gateway_requests_total{method="GET",status="200"} 7
+# TYPE gateway_request_duration_seconds histogram
+gateway_request_duration_seconds_bucket{le="0.005"} 7
+...
+gateway_request_duration_seconds_bucket{le="+Inf"} 11
+gateway_request_duration_seconds_count 11
+gateway_request_duration_seconds_sum 0.00316654
+```
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `gateway_requests_total` | counter | `method`, `status` |
+| `gateway_request_duration_seconds` | histogram | — |
+| `gateway_requests_in_flight` | gauge | — |
+| `gateway_rate_limited_requests_total` | counter | — |
+| `gateway_retry_attempts_total` | counter | — |
+| `gateway_retried_requests_total` | counter | — |
+| `gateway_circuit_opens_total` | counter | `service` |
+| `gateway_circuit_rejected_requests_total` | counter | `service` |
+| `gateway_backend_requests_total` | counter | `service` |
+| `gateway_backend_failures_total` | counter | `service` |
+| `gateway_backend_timeouts_total` | counter | `service` |
+| `gateway_backend_duration_seconds` | histogram | — |
+| `gateway_backend_health_failures_total` | counter | `service` |
+| `gateway_backend_health_recoveries_total` | counter | `service` |
+
+Total requests is the sum over `gateway_requests_total`, so per-method and
+per-status breakdowns are not duplicated into separate metrics.
+
+### Cardinality
+
+Only bounded, low-cardinality labels are used. `method` is an allowlist
+(cpp-httplib rejects anything outside its own method set, and unknown values
+fold into `other`); `status` is produced by the gateway or by a configured
+backend; `service` comes from the configured backend table, and every configured
+service is pre-created so a scrape shows it at zero. Request ids, client
+addresses, paths, query strings, headers and bodies are **never** used as
+labels. Each counter family also has a hard series cap, beyond which increments
+aggregate into an `other` series rather than creating more — a backstop so no
+request can grow the metric set without bound.
+
+### Counting rules
+
+- **Client requests vs backend attempts.** One client request counts once in
+  `gateway_requests_total`; each attempt it makes counts in
+  `gateway_backend_requests_total`. A request that retries onto a second
+  instance is one client request and two backend attempts.
+- **Retries.** The first attempt is not a retry. Two retries means
+  `gateway_retry_attempts_total` +2 and `gateway_retried_requests_total` +1.
+- **Circuit opens** increment only on a real transition into the open state, not
+  on every failure or state read.
+- **Latency** uses a monotonic clock and fixed buckets (`0.005 … 10` seconds),
+  so only bucket counts, a count and a sum are stored — never individual samples.
+- **In-flight** is held by an RAII guard, so early returns and exceptions cannot
+  leave it elevated.
+
+### Scraping policy
+
+Requests to `/metrics` are **excluded** from the request metrics. Scraping
+therefore does not move the numbers being scraped, and a scrape interval cannot
+inflate request counts or latency.
 
 ## Rate limiting
 
@@ -206,6 +278,7 @@ environment variables, then command-line flags.
 | Redis port      | `6379`               | `GATEWAY_REDIS_PORT`          | `--redis-port <1-65535>`      |
 | Redis prefix    | `gateway:ratelimit`  | `GATEWAY_REDIS_KEY_PREFIX`    | `--redis-key-prefix <text>`   |
 | Redis failure   | `open`               | `GATEWAY_REDIS_FAILURE_POLICY` | `--redis-failure-policy open\|closed` |
+| Metrics         | `on`                 | `GATEWAY_METRICS`             | `--metrics on\|off`            |
 
 `--backend` may be repeated; `GATEWAY_BACKENDS` takes a comma-separated list of
 the same `service=host:port` form. A leading `http://` is accepted and ignored.
@@ -483,9 +556,9 @@ tests/                  GoogleTest suite
 ```
 
 `src/circuit_breaker.cpp`, `src/config.cpp`, `src/health.cpp`,
-`src/load_balancer.cpp`, `src/middleware.cpp`, `src/proxy.cpp`,
-`src/rate_limiter.cpp`, `src/redis_rate_limiter.cpp`, `src/router.cpp` and
-`src/server.cpp` build into the `api_gateway_core` library, which both the
+`src/load_balancer.cpp`, `src/metrics.cpp`, `src/middleware.cpp`,
+`src/proxy.cpp`, `src/rate_limiter.cpp`, `src/redis_rate_limiter.cpp`,
+`src/router.cpp` and `src/server.cpp` build into the `api_gateway_core` library, which both the
 executable and the tests link against — the tests therefore run the same server
 code that ships.
 
@@ -498,6 +571,8 @@ Responsibilities are split so each answers one question:
   only component that probes backends, on its own thread.
 - `Pipeline` / `Middleware` — what happens around every request, regardless of
   where it is going? Knows nothing about routing or backends.
+- `MetricsRegistry` — what has this gateway been doing? Counters, gauges and
+  histograms plus Prometheus rendering; knows nothing about cpp-httplib.
 - `RateLimiter` — may this client make this request? `TokenBucketLimiter` and
   `SlidingWindowLimiter` hold local state; `RedisRateLimiter` holds none and
   defers to Redis. None of them knows anything about HTTP.
