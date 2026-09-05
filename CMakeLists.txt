@@ -12,9 +12,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Only the top-level project decides on testing and export of compile commands.
 if(PROJECT_IS_TOP_LEVEL)
     option(API_GATEWAY_BUILD_TESTS "Build the api-gateway test suite" ON)
+    option(API_GATEWAY_BUILD_BENCH "Build the benchmark backend" ON)
     set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 else()
     option(API_GATEWAY_BUILD_TESTS "Build the api-gateway test suite" OFF)
+    option(API_GATEWAY_BUILD_BENCH "Build the benchmark backend" OFF)
 endif()
 
 include(cmake/Dependencies.cmake)
@@ -57,4 +59,8 @@ target_link_libraries(api_gateway PRIVATE api_gateway::core api_gateway_warnings
 if(API_GATEWAY_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+if(API_GATEWAY_BUILD_BENCH)
+    add_subdirectory(bench)
 endif()

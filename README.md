@@ -254,6 +254,20 @@ outage into an outage for clients. There is no silent fallback to local
 counting, which would quietly break the shared limit; the limiter counts these
 fallbacks instead.
 
+## Benchmarking
+
+Performance is measured, not asserted. `bench/` holds a lightweight benchmark
+backend and a runner that starts it alongside the gateway, warms both up and
+drives load through each — see [bench/README.md](bench/README.md) for the
+methodology, the exact `wrk` commands and a recorded baseline.
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-release -j
+BUILD_DIR=$PWD/build-release ./bench/run_bench.sh --matrix --duration 30s
+```
+
+Nothing in `bench/` is part of the gateway library or binary.
+
 ## Configuration
 
 Settings are resolved lowest-to-highest precedence: built-in defaults,
