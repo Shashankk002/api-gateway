@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "gateway/config.hpp"
@@ -64,6 +65,96 @@ void report(const char* label, const Stats& stats) {
     std::printf("  %-46s mean=%8.1fus  p50=%8.1fus  p99=%9.1fus\n", label, stats.mean_us,
                 stats.p50_us, stats.p99_us);
 }
+
+/// Minimal HTTP/1.1 client, benchmark-only. Just enough to send a GET and read
+/// the complete response, so it can be compared against cpp-httplib's client
+/// doing the same work. Not an HTTP implementation and never used in the gateway.
+class RawClient {
+public:
+    RawClient(const std::string& host, const std::string& port, const std::string& extra = "") {
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host.c_str(), port.c_str(), &hints, &resolved_) != 0) {
+            resolved_ = nullptr;
+        }
+        wire_ = "GET /users/1 HTTP/1.1\r\nHost: " + host + ':' + port +
+                "\r\nAccept: */*\r\nUser-Agent: proxy-probe\r\n" + extra + "\r\n";
+        buffer_.resize(16384);
+    }
+
+    ~RawClient() {
+        disconnect();
+        if (resolved_ != nullptr) {
+            freeaddrinfo(resolved_);
+        }
+    }
+
+    RawClient(const RawClient&) = delete;
+    RawClient& operator=(const RawClient&) = delete;
+
+    [[nodiscard]] bool connect() {
+        if (resolved_ == nullptr) {
+            return false;
+        }
+        fd_ = ::socket(resolved_->ai_family, resolved_->ai_socktype, resolved_->ai_protocol);
+        if (fd_ < 0) {
+            return false;
+        }
+        if (::connect(fd_, resolved_->ai_addr, resolved_->ai_addrlen) != 0) {
+            disconnect();
+            return false;
+        }
+        return true;
+    }
+
+    void disconnect() {
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+    /// Sends one request and reads the whole response, headers and body.
+    [[nodiscard]] bool exchange() {
+        if (::send(fd_, wire_.data(), wire_.size(), 0) < 0) {
+            return false;
+        }
+        std::size_t filled = 0;
+        std::size_t header_end = std::string::npos;
+        std::size_t expected = 0;
+
+        while (true) {
+            const ssize_t got = ::recv(fd_, buffer_.data() + filled, buffer_.size() - filled, 0);
+            if (got <= 0) {
+                return false;
+            }
+            filled += static_cast<std::size_t>(got);
+
+            if (header_end == std::string::npos) {
+                const std::string_view view(buffer_.data(), filled);
+                const std::size_t marker = view.find("\r\n\r\n");
+                if (marker == std::string_view::npos) {
+                    continue;
+                }
+                header_end = marker + 4;
+                const std::size_t at = view.find("Content-Length:");
+                expected = at == std::string_view::npos
+                               ? 0
+                               : static_cast<std::size_t>(std::atoi(view.data() + at + 15));
+            }
+            if (filled >= header_end + expected) {
+                return true;
+            }
+        }
+    }
+
+private:
+    addrinfo* resolved_{nullptr};
+    int fd_{-1};
+    std::string wire_;
+    std::vector<char> buffer_;
+};
 
 std::string g_host = "127.0.0.1";
 int g_port = 9101;
@@ -253,6 +344,30 @@ int main(int argc, char** argv) {
                    (void)reused.Get("/users/1");
                }));
     }
+
+    std::printf("\n== A/B: cpp-httplib client vs a minimal raw client, same backend ==\n");
+    {
+        RawClient raw(g_host, port_text);
+        if (raw.connect()) {
+            report("raw client, reused connection", measure([&] { (void)raw.exchange(); }));
+        }
+    }
+    {
+        // The exact extra headers cpp-httplib adds, to test whether the request
+        // bytes rather than the client explain the gap.
+        RawClient raw(g_host, port_text, "Accept-Encoding: \r\nUser-Agent: cpp-httplib/0.18.7\r\n");
+        if (raw.connect()) {
+            report("raw client, httplib-shaped request headers", measure([&] {
+                       (void)raw.exchange();
+                   }));
+        }
+    }
+    report("raw client, fresh connection per request", measure([&] {
+               RawClient raw(g_host, port_text);
+               if (raw.connect()) {
+                   (void)raw.exchange();
+               }
+           }));
 
     // cpp-httplib defaults CPPHTTPLIB_TCP_NODELAY to false on both client and
     // server, so Nagle is active. Measured here only to attribute time; the

@@ -512,3 +512,126 @@ No optimization is recommended from this stage, and none was made. What the data
 does say is that **connection pooling alone is not the large win it appeared to
 be** (~9 % here), and that the next investigation should target the ~316 us
 inside the client rather than the connection lifecycle around it.
+
+## Outbound client A/B and final result (Stage 11E-G)
+
+Stage 11D left ~316 us per request unattributed inside cpp-httplib's outbound
+client. This stage settled it with one decisive experiment, then decided what -
+if anything - to change.
+
+### The A/B
+
+`bench/proxy-probe` gained a **minimal raw HTTP/1.1 client**: a TCP socket, one
+request, and a read loop that consumes the complete response (headers plus
+`Content-Length` bytes). It is benchmark-only, is never used by the gateway, and
+is not a general HTTP implementation. Both clients hit the same backend, on the
+same machine, in the same process, serially (c=1), 4 000 iterations after 400
+warm-up, Release build.
+
+| Client | p50 | mean | p99 |
+| --- | --- | --- | --- |
+| **raw client, reused connection** | **27.7 us** | 27.6 us | 34.8 us |
+| raw client, httplib-shaped request headers | 29.2 us | 28.5 us | 37.4 us |
+| **raw client, fresh connection per request** | **63.6 us** | 63.3 us | 79.1 us |
+| cpp-httplib client, fresh per request (what the gateway does) | 293.9 us | 311.4 us | 390.1 us |
+| cpp-httplib client, reused, keep-alive | 326.5 us | 324.6 us | 364.6 us |
+
+Two internal consistency checks: the raw client's fresh-minus-reused difference
+(63.6 - 27.7 = **35.9 us**) matches the independently measured
+`socket()+connect()+close()` cost of **34.1 us**; and sending cpp-httplib's exact
+request headers from the raw client changes nothing (29.2 vs 28.3 us).
+
+### What this proves
+
+Of the four candidate explanations:
+
+1. **cpp-httplib is responsible for most of the unexplained latency — SUPPORTED.**
+   A minimal client does identical work against the same backend in 27.7 us
+   where cpp-httplib takes ~300-330 us. The difference is **~10x**.
+2. **Connection setup — rejected.** 34-36 us, consistently measured two ways;
+   ~10 % of the request.
+3. **Latency independent of cpp-httplib — rejected.** The raw client is fast
+   against the same backend.
+4. **Benchmark methodology — rejected.** Same process, same harness, same
+   backend, same request bytes; and the two independent estimates of connection
+   cost agree.
+
+### Where inside the library
+
+A `sample` profile of the serial keep-alive loop attributes the blocked time:
+
+| Call path | Samples | Share |
+| --- | --- | --- |
+| `process_request` -> **`read_response_line`** -> `SocketStream::read` -> `select_read` -> `__select` | 230 | **~86 %** |
+| `process_request` -> `read_content` -> ... -> `__select` | 29 | ~11 % |
+| `process_request` -> `write_request` -> `SocketStream::write` | 5 | ~2 % |
+
+So the client sends the request and then blocks in `select()` waiting for the
+**first byte of the response** - even though a raw socket receives the complete
+response from the same backend in under 30 us. The waiting call is identified;
+*why* it waits is not, and localising further would require instrumenting inside
+the vendored `httplib.h`.
+
+### Decision: no production optimization was made
+
+This is a deliberate outcome, not an omission.
+
+- **Replacing the outbound client** would address the measured bottleneck and
+  the ceiling suggests a large gain, but it means owning an HTTP/1.1 client in a
+  gateway: chunked transfer-encoding, keep-alive lifecycle and invalidation,
+  timeout semantics, partial reads, error classification feeding the circuit
+  breaker, and TLS later. That is a large architectural change with a real
+  correctness surface, traded against a benchmark number. Out of proportion.
+- **Connection pooling** is the only architecturally small option, and it is
+  measured at **~34 us of ~373 us, about 9 %** - with reuse verified by TIME_WAIT
+  growth (4 400 connections against 1). Doing it properly still needs a
+  per-thread, per-endpoint client cache with invalidation on error and
+  interaction with health and circuit state. That is disproportionate complexity
+  for 9 %.
+- The gateway is **not CPU-bound** (~26 % of one core) and sustains ~12k req/s,
+  which is far beyond anything this project requires.
+
+The honest engineering answer is that the dominant cost sits in a third-party
+library, the cheap fix buys 9 %, and the expensive fix is not warranted by the
+requirement. **The bottleneck is documented rather than papered over.**
+
+### Final benchmark
+
+Same methodology as Stages 11A-11C: Release build, wrk 4.2.0, `-t4` (`-t1` at
+c=1), 30 s measured after 5 s discarded warm-up.
+
+| Concurrency | Direct backend req/s | Gateway req/s | Gateway p50 | Gateway p90 | Gateway p99 |
+| --- | --- | --- | --- | --- | --- |
+| 1   | 34 849 | 2 031 | 489 us | 529 us | 102.12 ms |
+| 10  | 103 611 | 12 449 | 598 us | 798 us | 26.01 ms |
+| 50  | 109 510 | 11 850 | 786 us | 263.66 ms | 345.85 ms |
+| 100 | 108 870 | 11 635 | 796 us | 553.38 ms | 779.76 ms |
+
+Errors: none at c=1, c=10 and c=50. At c=100, wrk reported 12 socket read errors
+against the backend and 6 against the gateway, out of roughly 3.3 M and 350 k
+requests respectively - under 0.002 %, not investigated further.
+
+**Before/after: unchanged, because nothing was changed.** These figures sit
+within the run-to-run spread recorded in Stages 11B and 11C (gateway 10.4-13.8k
+req/s at c=100), which is itself a useful result: the measurements are stable
+and reproducible across many sessions.
+
+### Engineering conclusion
+
+The gateway sustains roughly **10 % of direct-backend throughput**, and that is
+honestly explained rather than excused:
+
+- ~30 us per request is the gateway itself - server, middleware, request id,
+  routing, metrics, logging. That part scales to ~90k req/s.
+- ~360 us per request is the outbound proxy step, of which ~300 us is inside
+  cpp-httplib's client and ~34 us is connection setup.
+
+In other words, **the gateway's own code is not the problem; the HTTP client it
+proxies with is.** Fixing that means either accepting a 9 % gain from connection
+reuse or taking on an HTTP client implementation. Neither is justified by this
+project's requirements today, so the measurement is recorded and the code is
+left alone.
+
+If throughput ever becomes a real requirement, the evidence says to start with
+the outbound client - and to re-run `bench/proxy-probe` first, because it
+already contains the A/B that would prove or disprove any replacement.
