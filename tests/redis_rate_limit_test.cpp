@@ -21,8 +21,11 @@
 
 #include "gateway/config.hpp"
 #include "gateway/rate_limiter.hpp"
+#include "gateway/router.hpp"
 #include "gateway/redis_rate_limiter.hpp"
 #include "gateway_fixture.hpp"
+
+#include <httplib.h>
 
 namespace {
 
@@ -233,6 +236,167 @@ TEST_F(RedisIntegrationTest, NoFailuresAreRecordedWhenRedisIsHealthy) {
     }
 
     EXPECT_EQ(limiter->failure_count(), 0U) << "no fallback should have been needed";
+}
+
+/// Two whole gateway processes-in-miniature sharing one Redis budget, driven
+/// over real HTTP rather than through the limiter object.
+class RedisTwoGatewayTest : public RedisIntegrationTest {
+protected:
+    gateway::Router users_router() {
+        gateway::Router router;
+        router.add_route(gateway::Route{"GET", "/users", "users"});
+        return router;
+    }
+
+    gateway::ServerConfig gateway_config(std::uint64_t requests,
+                                         gateway::RedisFailurePolicy policy =
+                                             gateway::RedisFailurePolicy::kFailOpen) const {
+        gateway::ServerConfig config;
+        config.host = "127.0.0.1";
+        config.backends = {{"users", {backend_.endpoint()}}};
+        config.health_check_interval = std::chrono::milliseconds{0};
+        config.rate_limit_enabled = true;
+        config.rate_limit_mode = gateway::RateLimitMode::kRedis;
+        config.rate_limit_requests = requests;
+        config.rate_limit_window = std::chrono::hours{1};
+        config.redis_host = redis_host();
+        config.redis_port = redis_port();
+        config.redis_key_prefix = prefix_;
+        config.redis_failure_policy = policy;
+        return config;
+    }
+
+    gateway_test::TestBackend backend_{"users"};
+};
+
+TEST_F(RedisTwoGatewayTest, TwoGatewaysShareOneBudgetOverRealHttp) {
+    constexpr std::uint64_t kLimit = 6;
+    gateway_test::ScopedGateway first(gateway_config(kLimit), users_router());
+    gateway_test::ScopedGateway second(gateway_config(kLimit), users_router());
+    ASSERT_TRUE(first.ok());
+    ASSERT_TRUE(second.ok());
+
+    auto client_a = first.client();
+    auto client_b = second.client();
+
+    int allowed = 0;
+    int throttled = 0;
+    for (int round = 0; round < 5; ++round) {
+        for (httplib::Client* client : {&client_a, &client_b}) {
+            const auto response = client->Get("/users");
+            ASSERT_TRUE(response);
+            if (response->status == 200) {
+                ++allowed;
+            } else {
+                EXPECT_EQ(response->status, 429);
+                ++throttled;
+            }
+        }
+    }
+
+    EXPECT_EQ(allowed, static_cast<int>(kLimit))
+        << "the two gateways must share one budget, not get one each";
+    EXPECT_EQ(throttled, 10 - static_cast<int>(kLimit));
+    EXPECT_EQ(backend_.request_count(), kLimit)
+        << "throttled requests must not reach the backend on either gateway";
+}
+
+TEST_F(RedisTwoGatewayTest, ConcurrentTrafficAcrossGatewaysNeverExceedsTheSharedLimit) {
+    constexpr std::uint64_t kLimit = 20;
+    gateway_test::ScopedGateway first(gateway_config(kLimit), users_router());
+    gateway_test::ScopedGateway second(gateway_config(kLimit), users_router());
+    ASSERT_TRUE(first.ok());
+    ASSERT_TRUE(second.ok());
+
+    constexpr int kThreadsPerGateway = 4;
+    constexpr int kPerThread = 15;
+    std::atomic<int> allowed{0};
+    std::atomic<int> answered{0};
+
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadsPerGateway * 2);
+    for (const gateway_test::ScopedGateway* instance : {&first, &second}) {
+        for (int t = 0; t < kThreadsPerGateway; ++t) {
+            threads.emplace_back([instance, &allowed, &answered] {
+                auto client = instance->client();
+                for (int i = 0; i < kPerThread; ++i) {
+                    const auto response = client.Get("/users");
+                    if (!response) {
+                        continue;
+                    }
+                    ++answered;
+                    if (response->status == 200) {
+                        ++allowed;
+                    }
+                }
+            });
+        }
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ(answered.load(), kThreadsPerGateway * 2 * kPerThread);
+    // Atomicity is the property under test: a read-then-write race across the
+    // two gateways would let more than the allowance through.
+    EXPECT_EQ(allowed.load(), static_cast<int>(kLimit))
+        << "the Redis decision must be atomic across gateways";
+    EXPECT_EQ(backend_.request_count(), kLimit);
+}
+
+TEST_F(RedisTwoGatewayTest, RedisBackedThrottlingStillCostsOneDecisionPerClientRequest) {
+    gateway_test::ScopedGateway instance(gateway_config(3), users_router());
+    ASSERT_TRUE(instance.ok());
+
+    auto client = instance.client();
+    for (int i = 0; i < 3; ++i) {
+        const auto response = client.Get("/users");
+        ASSERT_TRUE(response);
+        EXPECT_EQ(response->status, 200);
+    }
+    const auto rejected = client.Get("/users");
+    ASSERT_TRUE(rejected);
+    EXPECT_EQ(rejected->status, 429);
+    EXPECT_FALSE(rejected->get_header_value("Retry-After").empty());
+    EXPECT_EQ(rejected->get_header_value("RateLimit-Limit"), "3");
+    EXPECT_FALSE(rejected->get_header_value("X-Request-Id").empty());
+
+    EXPECT_EQ(instance.server().metrics().rate_limited.value(), 1U);
+    EXPECT_EQ(instance.server().metrics().backend_requests.value({"users"}), 3U);
+}
+
+/// Fail-closed with Redis unreachable, driven through the gateway.
+TEST_F(RedisTwoGatewayTest, FailClosedRejectsThroughTheGatewayWhenRedisIsGone) {
+    auto config = gateway_config(1000, gateway::RedisFailurePolicy::kFailClosed);
+    config.redis_port = closed_port();  // Nothing listening.
+    gateway_test::ScopedGateway instance(std::move(config), users_router());
+    ASSERT_TRUE(instance.ok());
+
+    auto client = instance.client();
+    const auto response = client.Get("/users");
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 429) << "fail-closed must reject rather than pass through";
+    EXPECT_EQ(backend_.request_count(), 0U);
+    EXPECT_EQ(instance.server().metrics().rate_limited.value(), 1U);
+}
+
+TEST_F(RedisTwoGatewayTest, FailOpenServesThroughTheGatewayWhenRedisIsGone) {
+    auto config = gateway_config(1, gateway::RedisFailurePolicy::kFailOpen);
+    config.redis_port = closed_port();
+    gateway_test::ScopedGateway instance(std::move(config), users_router());
+    ASSERT_TRUE(instance.ok());
+
+    auto client = instance.client();
+    // The allowance is 1, but Redis is unreachable, so fail-open lets them by
+    // rather than inventing a local limit.
+    for (int i = 0; i < 5; ++i) {
+        const auto response = client.Get("/users");
+        ASSERT_TRUE(response);
+        EXPECT_EQ(response->status, 200) << "request " << i;
+    }
+    EXPECT_EQ(backend_.request_count(), 5U);
+    EXPECT_EQ(instance.server().metrics().rate_limited.value(), 0U);
 }
 
 }  // namespace

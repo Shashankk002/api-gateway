@@ -238,6 +238,52 @@ public:
     gateway::LoadBalancer balancer;
 };
 
+/// Runs a real gateway for the duration of a scope and shuts it down cleanly.
+/// Used where a test needs more than one gateway, or needs to control their
+/// lifetimes directly, rather than the single server GatewayServerTestBase runs.
+class ScopedGateway {
+public:
+    ScopedGateway(gateway::ServerConfig config, gateway::Router router,
+                  std::shared_ptr<gateway::LogSink> sink = nullptr)
+        : server_(std::make_unique<gateway::GatewayServer>(
+              std::move(config), std::move(router),
+              sink != nullptr ? std::move(sink)
+                              : std::make_shared<gateway::CapturingLogSink>())) {
+        bound_ = server_->bind(0);
+        if (bound_) {
+            thread_ = std::thread([this] { (void)server_->serve(); });
+            ready_ = server_->wait_until_ready();
+        }
+    }
+
+    ~ScopedGateway() {
+        server_->stop();
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    ScopedGateway(const ScopedGateway&) = delete;
+    ScopedGateway& operator=(const ScopedGateway&) = delete;
+
+    [[nodiscard]] bool ok() const { return bound_ && ready_; }
+
+    [[nodiscard]] httplib::Client client() const {
+        httplib::Client client("127.0.0.1", server_->bound_port());
+        client.set_connection_timeout(5, 0);
+        client.set_read_timeout(5, 0);
+        return client;
+    }
+
+    [[nodiscard]] gateway::GatewayServer& server() const { return *server_; }
+
+private:
+    std::unique_ptr<gateway::GatewayServer> server_;
+    std::thread thread_;
+    bool bound_{false};
+    bool ready_{false};
+};
+
 /// Base fixture for integration tests: runs a real GatewayServer on an
 /// OS-assigned loopback port for the duration of one test, and hands out
 /// clients pointed at it.

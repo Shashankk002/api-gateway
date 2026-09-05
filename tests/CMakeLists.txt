@@ -7,6 +7,7 @@ add_executable(api_gateway_tests
     health_check_test.cpp
     health_endpoint_test.cpp
     load_balancer_test.cpp
+    lifecycle_stress_test.cpp
     load_balancing_integration_test.cpp
     metrics_integration_test.cpp
     metrics_test.cpp
@@ -18,6 +19,7 @@ add_executable(api_gateway_tests
     redis_rate_limit_test.cpp
     reliability_integration_test.cpp
     router_test.cpp
+    system_failure_test.cpp
     routing_integration_test.cpp)
 
 target_link_libraries(api_gateway_tests
