@@ -19,6 +19,12 @@ else()
     option(API_GATEWAY_BUILD_BENCH "Build the benchmark backend" OFF)
 endif()
 
+# Benchmark experiment knob (Stage 11C). Empty by default, which leaves
+# cpp-httplib's own worker-pool default in place, so production behaviour is
+# unchanged unless a build explicitly asks otherwise.
+set(API_GATEWAY_HTTPLIB_THREAD_POOL_COUNT "" CACHE STRING
+    "Override CPPHTTPLIB_THREAD_POOL_COUNT for benchmark builds; empty keeps the default")
+
 include(cmake/Dependencies.cmake)
 
 # Warning flags applied to first-party targets only, never to fetched sources.
@@ -51,6 +57,15 @@ target_include_directories(api_gateway_core PUBLIC
 target_link_libraries(api_gateway_core
     PUBLIC httplib::httplib
     PRIVATE hiredis::hiredis api_gateway_warnings)
+
+if(API_GATEWAY_HTTPLIB_THREAD_POOL_COUNT)
+    # PUBLIC because cpp-httplib is header-only: every translation unit that
+    # includes it must agree on the value.
+    target_compile_definitions(api_gateway_core PUBLIC
+        CPPHTTPLIB_THREAD_POOL_COUNT=${API_GATEWAY_HTTPLIB_THREAD_POOL_COUNT})
+    message(STATUS "api-gateway: cpp-httplib worker pool pinned to "
+                   "${API_GATEWAY_HTTPLIB_THREAD_POOL_COUNT}")
+endif()
 
 add_executable(api_gateway src/main.cpp)
 set_target_properties(api_gateway PROPERTIES OUTPUT_NAME api-gateway)
