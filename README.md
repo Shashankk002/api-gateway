@@ -2,7 +2,7 @@
 
 A C++20 HTTP API gateway, built up in stages.
 
-**Current stage: 7 — rate limiting.**
+**Current stage: 8 — middleware and request pipeline.**
 
 The gateway starts an HTTP listener, answers `GET /health` itself, and resolves
 every other request against a route table that maps a method and path prefix to
@@ -12,7 +12,9 @@ round-robin and the request is forwarded to it, with the backend's response
 returned to the client. A transient failure on a safe method is retried once
 onto another instance, and an instance that keeps failing has its circuit opened
 so it stops receiving traffic until it recovers. Clients can be rate limited
-per IP, locally or through Redis shared across gateway instances.
+per IP, locally or through Redis shared across gateway instances. Every request
+runs through a small middleware pipeline that gives it a correlation id and logs
+its outcome.
 
 ## Requirements
 
@@ -56,6 +58,59 @@ docker run --rm -p 6379:6379 redis:7-alpine
 `GATEWAY_REDIS_TEST_HOST` and `GATEWAY_REDIS_TEST_PORT` override the endpoint.
 
 To build without tests, configure with `-DAPI_GATEWAY_BUILD_TESTS=OFF`.
+
+## Request pipeline
+
+Cross-cutting concerns live in a small middleware pipeline rather than
+accumulating inside `GatewayServer`:
+
+```
+Request ID -> Logging -> gateway dispatch (routing, rate limiting,
+                          selection, circuit breakers, retries, proxying)
+```
+
+A middleware runs before `next`, may skip calling it to end the request early,
+and may inspect or adjust the response afterwards. Routing and the backend
+machinery deliberately stay inside the terminal step: they are the gateway's
+job, not cross-cutting concerns, and forcing them into generic middleware would
+buy nothing.
+
+`RequestContext` is built per request and holds only what is shared across the
+chain — references to the request and response, the request id and the
+rate-limit client key. It holds no global state and is never touched by another
+thread, so it needs no synchronisation, and the request body is referenced
+rather than copied.
+
+`GET /health` runs through the pipeline too, so it gets an id and a log line,
+but it stays gateway-owned: it never reaches routing, rate limiting, circuit
+breakers or a backend.
+
+### Request id
+
+Every response carries `X-Request-Id`: 128 bits as 32 hex characters, drawn from
+a per-thread generator so there is no lock and no shared stream.
+
+An inbound `X-Request-Id` is **ignored** rather than adopted. Without
+trusted-proxy configuration it is client-supplied, and the gateway already
+declines to trust such headers for the rate-limit key. The id is for correlation
+only and carries no authority.
+
+The header is written after the rest of the pipeline returns, because the proxy
+replaces the whole header map when it copies a backend response.
+
+### Access log
+
+One line per request on stderr, the channel the gateway already uses:
+
+```
+gateway: request 4f3c...9a1b GET /users/7?debug=1 -> 200 3ms
+```
+
+Request id, method, target, final status and duration from a monotonic clock.
+Successes and failures alike, including requests that ended in an exception.
+Headers and bodies are never touched, so credentials cannot leak through it, and
+the target is truncated at 256 characters. Output goes through a `LogSink`, so
+tests capture lines instead of asserting on stderr.
 
 ## Rate limiting
 
@@ -428,9 +483,9 @@ tests/                  GoogleTest suite
 ```
 
 `src/circuit_breaker.cpp`, `src/config.cpp`, `src/health.cpp`,
-`src/load_balancer.cpp`, `src/proxy.cpp`, `src/rate_limiter.cpp`,
-`src/redis_rate_limiter.cpp`, `src/router.cpp` and `src/server.cpp` build into
-the `api_gateway_core` library, which both the
+`src/load_balancer.cpp`, `src/middleware.cpp`, `src/proxy.cpp`,
+`src/rate_limiter.cpp`, `src/redis_rate_limiter.cpp`, `src/router.cpp` and
+`src/server.cpp` build into the `api_gateway_core` library, which both the
 executable and the tests link against — the tests therefore run the same server
 code that ships.
 
@@ -441,6 +496,8 @@ Responsibilities are split so each answers one question:
 - `ServerConfig` — where are that service's instances, and how long may they take?
 - `BackendHealth` / `HealthChecker` — is this instance currently healthy? The
   only component that probes backends, on its own thread.
+- `Pipeline` / `Middleware` — what happens around every request, regardless of
+  where it is going? Knows nothing about routing or backends.
 - `RateLimiter` — may this client make this request? `TokenBucketLimiter` and
   `SlidingWindowLimiter` hold local state; `RedisRateLimiter` holds none and
   defers to Redis. None of them knows anything about HTTP.

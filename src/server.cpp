@@ -11,6 +11,7 @@
 
 #include "gateway/circuit_breaker.hpp"
 #include "gateway/health.hpp"
+#include "gateway/middleware.hpp"
 #include "gateway/rate_limiter.hpp"
 #include "gateway/redis_rate_limiter.hpp"
 #include "gateway/load_balancer.hpp"
@@ -165,7 +166,8 @@ std::string allow_header_value(const std::vector<std::string_view>& allowed_meth
 GatewayServer::GatewayServer(ServerConfig config)
     : GatewayServer(std::move(config), default_service_router()) {}
 
-GatewayServer::GatewayServer(ServerConfig config, Router router)
+GatewayServer::GatewayServer(ServerConfig config, Router router,
+                             std::shared_ptr<LogSink> log_sink)
     : config_(std::move(config)),
       limiter_(make_rate_limiter(config_)),
       health_(config_.backends),
@@ -175,14 +177,28 @@ GatewayServer::GatewayServer(ServerConfig config, Router router)
       proxy_(config_.backend_timeout),
       checker_(config_.backends, health_, config_.health_check_interval, config_.backend_timeout),
       http_(std::make_unique<httplib::Server>()) {
+    // Outermost first: the id exists before anything logs it, and logging sees
+    // whatever status the rest of the pipeline finally settles on.
+    pipeline_.use(std::make_unique<RequestIdMiddleware>());
+    pipeline_.use(std::make_unique<LoggingMiddleware>(
+        log_sink != nullptr ? std::move(log_sink) : std::make_shared<StderrLogSink>()));
+
     register_routes();
     checker_.start();
 }
 
 GatewayServer::~GatewayServer() = default;
 
-void GatewayServer::handle_service_request(const httplib::Request& request,
-                                           httplib::Response& response) const {
+void GatewayServer::run_pipeline(const httplib::Request& request, httplib::Response& response,
+                                 const Handler& terminal) const {
+    RequestContext context(request, response);
+    context.client_key = client_key(request);
+    pipeline_.run(context, terminal);
+}
+
+void GatewayServer::handle_service_request(RequestContext& context) const {
+    const httplib::Request& request = context.request;
+    httplib::Response& response = context.response;
     const RouteMatch match = router_.match(request.method, request.path);
 
     switch (match.status) {
@@ -195,7 +211,7 @@ void GatewayServer::handle_service_request(const httplib::Request& request,
             // Runs before any backend machinery: a rejected request never picks
             // an instance, never touches a circuit and never spends retry budget.
             const RateLimitDecision decision =
-                limiter_->acquire(client_key(request), RateLimiter::Clock::now());
+                limiter_->acquire(context.client_key, RateLimiter::Clock::now());
             if (!decision.allowed) {
                 respond_gateway_error(response, httplib::StatusCode::TooManyRequests_429,
                                       "rate_limited", "rate_limit_exceeded",
@@ -327,21 +343,28 @@ std::string GatewayServer::client_key(const httplib::Request& request) {
 }
 
 void GatewayServer::register_routes() {
-    http_->Get(kHealthPath, [](const httplib::Request&, httplib::Response& response) {
-        response.set_content(kHealthyBody, kJsonContentType);
+    // /health stays gateway-owned and registered ahead of the catch-alls; it
+    // runs through the pipeline only for the cross-cutting concerns, never
+    // through routing, rate limiting or proxying.
+    http_->Get(kHealthPath, [this](const httplib::Request& request, httplib::Response& response) {
+        run_pipeline(request, response, [](RequestContext& context) {
+            context.response.set_content(kHealthyBody, kJsonContentType);
+        });
     });
 
     // Per-method catch-alls rather than a pre-routing handler: httplib reads the
     // request body only after routing, and the proxy needs it.
     const auto handler = [this](const httplib::Request& request, httplib::Response& response) {
-        if (request.path == kHealthPath) {
-            // Gateway-owned. GET is served above; no other method is offered to
-            // the router, so /health can never reach a backend.
-            response.status = httplib::StatusCode::NotFound_404;
-            response.set_content(kNotFoundBody, kJsonContentType);
-            return;
-        }
-        handle_service_request(request, response);
+        run_pipeline(request, response, [this](RequestContext& context) {
+            if (context.request.path == kHealthPath) {
+                // Gateway-owned. GET is served above; no other method is offered
+                // to the router, so /health can never reach a backend.
+                context.response.status = httplib::StatusCode::NotFound_404;
+                context.response.set_content(kNotFoundBody, kJsonContentType);
+                return;
+            }
+            handle_service_request(context);
+        });
     };
     http_->Get(kCatchAllPattern, handler);
     http_->Post(kCatchAllPattern, handler);

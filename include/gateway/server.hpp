@@ -7,6 +7,7 @@
 #include "gateway/config.hpp"
 #include "gateway/health.hpp"
 #include "gateway/load_balancer.hpp"
+#include "gateway/middleware.hpp"
 #include "gateway/proxy.hpp"
 #include "gateway/rate_limiter.hpp"
 #include "gateway/router.hpp"
@@ -24,8 +25,11 @@ namespace gateway {
 /// It answers `GET /health` itself and delegates every other path to a Router,
 /// which decides whether the request belongs to a logical service, is
 /// method-not-allowed, or is unknown. For a matched request the LoadBalancer
-/// is rate limited first; if it is over its allowance the gateway answers 429
-/// without touching any backend machinery. Otherwise the LoadBalancer picks one
+/// Every request runs through a small middleware pipeline first, which assigns
+/// a correlation id and logs the outcome; the gateway's own dispatch is that
+/// pipeline's terminal step. Inside it, a matched request is rate limited first;
+/// if it is over its allowance the gateway answers 429 without touching any
+/// backend machinery. Otherwise the LoadBalancer picks one
 /// of that service's eligible backend instances and the ReverseProxy forwards
 /// to it. On a transient failure the server may retry onto another
 /// eligible instance within a bounded budget, recording each outcome in that
@@ -48,9 +52,11 @@ public:
     explicit GatewayServer(ServerConfig config);
 
     /// Serves an explicit route table. Backends and the backend timeout come
-    /// from `config`. Used by tests today, and the seam through which
-    /// configured routes will arrive later.
-    GatewayServer(ServerConfig config, Router router);
+    /// from `config`. `log_sink` receives the access log; a null sink means
+    /// std::cerr. Used by tests today, and the seam through which configured
+    /// routes will arrive later.
+    GatewayServer(ServerConfig config, Router router,
+                  std::shared_ptr<LogSink> log_sink = nullptr);
 
     ~GatewayServer();
 
@@ -83,6 +89,9 @@ public:
     [[nodiscard]] const BackendHealth& health() const noexcept { return health_; }
     [[nodiscard]] const CircuitBreakers& breakers() const noexcept { return breakers_; }
 
+    /// The middleware wrapped around every request.
+    [[nodiscard]] const Pipeline& pipeline() const noexcept { return pipeline_; }
+
     /// The active limiter, or nullptr when rate limiting is disabled.
     [[nodiscard]] RateLimiter* rate_limiter() const noexcept { return limiter_.get(); }
 
@@ -96,9 +105,13 @@ public:
 private:
     void register_routes();
 
-    /// Turns the Router's decision for `request` into a response, proxying to a
-    /// selected backend instance when the request matches a route.
-    void handle_service_request(const httplib::Request& request, httplib::Response& response) const;
+    /// Runs one request through the pipeline, ending in `terminal`.
+    void run_pipeline(const httplib::Request& request, httplib::Response& response,
+                      const Handler& terminal) const;
+
+    /// Turns the Router's decision for the request into a response, proxying to
+    /// a selected backend instance when it matches a route.
+    void handle_service_request(RequestContext& context) const;
 
     /// Selects an eligible instance of `service`, forwards to it, and retries
     /// onto other instances while the failure is transient and budget remains.
@@ -108,6 +121,7 @@ private:
     // Declaration order is also destruction order reversed: health_ outlives
     // both the balancer that reads it and the checker that writes it.
     ServerConfig config_;
+    Pipeline pipeline_;
     std::unique_ptr<RateLimiter> limiter_;
     BackendHealth health_;
     CircuitBreakers breakers_;

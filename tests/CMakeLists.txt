@@ -8,6 +8,8 @@ add_executable(api_gateway_tests
     health_endpoint_test.cpp
     load_balancer_test.cpp
     load_balancing_integration_test.cpp
+    middleware_test.cpp
+    pipeline_integration_test.cpp
     proxy_integration_test.cpp
     rate_limit_integration_test.cpp
     rate_limiter_test.cpp

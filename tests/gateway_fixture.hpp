@@ -19,6 +19,7 @@
 #include "gateway/config.hpp"
 #include "gateway/health.hpp"
 #include "gateway/load_balancer.hpp"
+#include "gateway/middleware.hpp"
 #include "gateway/rate_limiter.hpp"
 #include "gateway/router.hpp"
 #include "gateway/server.hpp"
@@ -262,7 +263,10 @@ protected:
     virtual gateway::ServerConfig make_config() { return loopback_config(); }
 
     void SetUp() override {
-        server_ = std::make_unique<gateway::GatewayServer>(make_config(), make_router());
+        // Captured rather than written to stderr, so the suite stays quiet and
+        // logging assertions have something to read.
+        log_sink_ = std::make_shared<gateway::CapturingLogSink>();
+        server_ = std::make_unique<gateway::GatewayServer>(make_config(), make_router(), log_sink_);
 
         // Port 0 lets the OS pick a free port, so tests never collide.
         ASSERT_TRUE(server_->bind(0)) << "could not bind an ephemeral port";
@@ -291,6 +295,9 @@ protected:
     /// The running gateway's rate limiter, or nullptr when disabled.
     [[nodiscard]] gateway::RateLimiter* rate_limiter() const { return server_->rate_limiter(); }
 
+    /// Access-log lines this gateway has written.
+    [[nodiscard]] gateway::CapturingLogSink& log_sink() const { return *log_sink_; }
+
     /// Waits for `predicate` to hold, bounded, without polling sleeps.
     [[nodiscard]] bool wait_for_health(const std::function<bool()>& predicate) const {
         return server_->health().wait_for(predicate, kHealthWaitTimeout);
@@ -304,6 +311,7 @@ protected:
     }
 
 private:
+    std::shared_ptr<gateway::CapturingLogSink> log_sink_;
     std::unique_ptr<gateway::GatewayServer> server_;
     std::thread serve_thread_;
     std::uint16_t port_{0};

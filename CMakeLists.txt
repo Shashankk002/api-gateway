@@ -35,6 +35,7 @@ add_library(api_gateway_core
     src/config.cpp
     src/health.cpp
     src/load_balancer.cpp
+    src/middleware.cpp
     src/proxy.cpp
     src/rate_limiter.cpp
     src/redis_rate_limiter.cpp
