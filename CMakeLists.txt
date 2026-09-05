@@ -19,6 +19,9 @@ else()
     option(API_GATEWAY_BUILD_BENCH "Build the benchmark tools" OFF)
 endif()
 
+# Built only for the Docker Compose demo; never linked into the gateway.
+option(API_GATEWAY_BUILD_DEMO_BACKEND "Build the Compose demo backend" OFF)
+
 include(cmake/Dependencies.cmake)
 
 # Warning flags applied to first-party targets only, never to fetched sources.
@@ -63,4 +66,10 @@ endif()
 
 if(API_GATEWAY_BUILD_BENCH)
     add_subdirectory(bench)
+endif()
+
+if(API_GATEWAY_BUILD_DEMO_BACKEND)
+    add_executable(demo_backend docker/demo_backend.cpp)
+    set_target_properties(demo_backend PROPERTIES OUTPUT_NAME demo-backend)
+    target_link_libraries(demo_backend PRIVATE httplib::httplib api_gateway_warnings)
 endif()

@@ -1,0 +1,98 @@
+# Demo deployment: one gateway, one Redis, and six backend instances across
+# three logical services. Backends are addressed by Compose DNS name, so no
+# container IP appears anywhere in this file.
+#
+# Two independent notions of health are at work here:
+#   - Docker's healthcheck answers "is this container alive?" and drives
+#     depends_on ordering.
+#   - The gateway's own health checker answers "should this backend receive
+#     traffic?" and drives load-balancer eligibility.
+# Neither is derived from the other.
+
+name: api-gateway
+
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+    target: backend
+  image: api-gateway/demo-backend:latest
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: gateway
+    image: api-gateway/gateway:latest
+    # PID 1 does not get default signal actions, so without an init the
+    # gateway would ignore SIGTERM and be killed after the stop timeout.
+    init: true
+    ports:
+      - "8080:8080"
+    environment:
+      GATEWAY_HOST: 0.0.0.0
+      GATEWAY_PORT: 8080
+
+      # Service instances, by Compose DNS name. Repeating a service name adds
+      # an instance to it.
+      GATEWAY_BACKENDS: "users=users-1:9000,users=users-2:9000,users=users-3:9000,orders=orders-1:9000,orders=orders-2:9000,products=products-1:9000"
+
+      # Short enough that stopping a backend visibly removes it from rotation
+      # within a few seconds.
+      GATEWAY_HEALTH_CHECK_INTERVAL_MS: 2000
+      GATEWAY_BACKEND_TIMEOUT_MS: 2000
+
+      GATEWAY_MAX_RETRIES: 1
+      GATEWAY_CIRCUIT_FAILURE_THRESHOLD: 5
+      GATEWAY_CIRCUIT_COOLDOWN_MS: 10000
+
+      GATEWAY_RATE_LIMIT: "on"
+      GATEWAY_RATE_LIMIT_MODE: redis
+      GATEWAY_RATE_LIMIT_ALGORITHM: token-bucket
+      GATEWAY_RATE_LIMIT_REQUESTS: 100
+      GATEWAY_RATE_LIMIT_WINDOW_MS: 60000
+      GATEWAY_REDIS_HOST: redis
+      GATEWAY_REDIS_PORT: 6379
+      GATEWAY_REDIS_FAILURE_POLICY: open
+
+      GATEWAY_METRICS: "on"
+    # Container readiness only. The gateway does not need these to be up, but
+    # waiting keeps the first request of a fresh demo from racing startup.
+    depends_on:
+      redis: {condition: service_healthy}
+      users-1: {condition: service_healthy}
+      users-2: {condition: service_healthy}
+      users-3: {condition: service_healthy}
+      orders-1: {condition: service_healthy}
+      orders-2: {condition: service_healthy}
+      products-1: {condition: service_healthy}
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  users-1:
+    <<: *backend
+    environment: {BACKEND_NAME: users-1}
+  users-2:
+    <<: *backend
+    environment: {BACKEND_NAME: users-2}
+  users-3:
+    <<: *backend
+    environment: {BACKEND_NAME: users-3}
+
+  orders-1:
+    <<: *backend
+    environment: {BACKEND_NAME: orders-1}
+  orders-2:
+    <<: *backend
+    environment: {BACKEND_NAME: orders-2}
+
+  products-1:
+    <<: *backend
+    environment: {BACKEND_NAME: products-1}

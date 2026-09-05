@@ -63,6 +63,123 @@ docker run --rm -p 6379:6379 redis:7-alpine
 
 To build without tests, configure with `-DAPI_GATEWAY_BUILD_TESTS=OFF`.
 
+## Docker
+
+`docker compose up` brings up the gateway, Redis, and six backend instances
+across three services, all on a normal Compose bridge network. Backends are
+addressed by DNS service name; no container IP appears in any configuration.
+
+```sh
+docker compose up --build -d
+curl -s localhost:8080/health
+```
+
+### Architecture
+
+```
+                    ┌─► users-1   users-2   users-3   (service "users")
+client ──► gateway ─┼─► orders-1  orders-2            (service "orders")
+        (host :8080)└─► products-1                    (service "products")
+              │
+              └────────► redis    (shared rate-limit state)
+```
+
+The gateway is the only service published to the host. Backends and Redis are
+reachable only from inside the Compose network.
+
+### Services
+
+| Service | Image | Role |
+| --- | --- | --- |
+| `gateway` | built from `docker/Dockerfile`, target `gateway` | The gateway; the only published port (`8080`) |
+| `redis` | `redis:7-alpine` | Rate-limit state shared across gateway processes |
+| `users-1..3`, `orders-1..2`, `products-1` | built from `docker/Dockerfile`, target `backend` | `docker/demo_backend.cpp`: answers `/health` and returns its own name, so round-robin and failover are visible in the response body |
+
+Both images are built from one multi-stage `docker/Dockerfile`. The build stage
+compiles in Release mode with tests off, so GoogleTest is never fetched; the
+runtime stage carries the binary, the C++ runtime and `curl` for the container
+health check, and runs as a non-root user. No compiler, CMake or source is
+shipped.
+
+### Two kinds of health
+
+The two health mechanisms answer different questions and neither is derived from
+the other:
+
+- **Docker's `HEALTHCHECK`** — is this container alive? It drives `depends_on`
+  and what `docker compose ps` reports.
+- **The gateway's health checker** — should this backend receive traffic? It
+  probes every instance's `/health` on its own schedule (2 s here) and drives
+  load-balancer eligibility.
+
+A backend can be Docker-healthy in the second before the gateway's next sweep,
+which is exactly why retries exist.
+
+### Verification
+
+```sh
+curl -s localhost:8080/health
+for i in $(seq 6); do curl -s localhost:8080/users/$i; echo; done
+curl -s localhost:8080/metrics | grep gateway_backend_requests_total
+```
+
+The six `users` requests cycle through `users-1`, `users-2`, `users-3` in order.
+
+### Failure demo
+
+```sh
+docker compose stop users-2
+sleep 5                                   # one health-check interval, plus slack
+for i in $(seq 6); do curl -s localhost:8080/users/$i; echo; done
+docker compose logs gateway | grep unhealthy
+
+docker compose start users-2
+sleep 6
+for i in $(seq 6); do curl -s localhost:8080/users/$i; echo; done
+```
+
+Traffic skips `users-2` while it is down and returns to it on recovery, with no
+gateway restart. To see retries instead of exclusion, use `docker compose kill`
+and send requests immediately: the instance is gone before the next sweep, so
+requests land on it, fail, and are retried onto another instance — the client
+still sees `200`, and `gateway_retry_attempts_total` goes up.
+
+### Redis rate limiting
+
+The demo allows 100 requests per 60 s per client address, held in Redis:
+
+```sh
+for i in $(seq 120); do curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/users/1; done | sort | uniq -c
+docker compose exec redis redis-cli KEYS 'gateway:ratelimit*'
+```
+
+Roughly 100 succeed and the rest get `429` with `Retry-After`. The key is a
+Redis hash, so a second gateway process would share the same budget.
+
+Stopping Redis exercises the configured failure policy. The demo sets
+`GATEWAY_REDIS_FAILURE_POLICY=open`, so requests keep succeeding when Redis is
+unreachable:
+
+```sh
+docker compose stop redis
+curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/users/1   # 200
+docker compose start redis
+```
+
+With `closed` the same requests return `429` instead. The gateway reconnects on
+its own once Redis is back; it holds no assumption that a once-healthy Redis
+stays reachable.
+
+### Shutdown
+
+```sh
+docker compose down
+```
+
+The gateway runs with `init: true` because a PID 1 process does not get default
+signal actions, so without an init it would ignore `SIGTERM` and be killed after
+the stop timeout. The demo backend installs its own `SIGTERM` handler.
+
 ## Request pipeline
 
 Cross-cutting concerns live in a small middleware pipeline rather than
@@ -572,6 +689,8 @@ include/gateway/          Public headers
 src/                      Implementation; main.cpp is the entry point only
 tests/                    GoogleTest suite
 bench/                    Benchmark tooling and results (not built into the gateway)
+docker/                   Multi-stage Dockerfile and the Compose demo backend
+docker-compose.yml        Gateway, Redis and six backend instances
 ```
 
 Everything in `src/` except `main.cpp` builds into the `api_gateway_core`

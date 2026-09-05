@@ -1,0 +1,25 @@
+# Local build trees and CMake output.
+build*/
+cmake-build-*/
+_deps/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+Testing/
+
+.git/
+.gitignore
+
+# Not read by the image build: the Dockerfile copies only CMakeLists.txt,
+# cmake/, include/, src/ and docker/demo_backend.cpp.
+tests/
+bench/
+config/
+*.md
+docker-compose.yml
+
+# Editor and OS files.
+.vscode/
+.idea/
+.DS_Store
+*.swp
