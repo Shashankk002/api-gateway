@@ -25,9 +25,7 @@ using gateway::Router;
 constexpr std::chrono::milliseconds kInterval{50};
 constexpr std::chrono::milliseconds kProbeTimeout{2000};
 
-bool contains(const std::string& haystack, const std::string& needle) {
-    return haystack.find(needle) != std::string::npos;
-}
+using gateway_test::contains;
 
 Router users_router() {
     Router router;
@@ -265,10 +263,7 @@ protected:
     }
 
     gateway_test::TestBackend live_{"live"};
-    const gateway::BackendEndpoint closed_endpoint_ = [] {
-        const gateway_test::TestBackend probe;  // frees its port when destroyed
-        return probe.endpoint();
-    }();
+    const gateway::BackendEndpoint closed_endpoint_ = gateway_test::closed_endpoint();
 };
 
 TEST_F(UnreachableInstanceHealthTest, ConnectionFailureMarksAnInstanceUnhealthyAndDrainsIt) {

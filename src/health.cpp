@@ -45,7 +45,7 @@ bool BackendHealth::set_healthy(std::string_view service, std::size_t index, boo
         return false;
     }
 
-    // Taken and released so a waiter cannot evaluate its predicate and start
+    // Taken and released so a waiter cannot evaluate its predicate and begin
     // waiting between the exchange above and the notify below.
     { const std::lock_guard<std::mutex> guard(mutex_); }
     changed_.notify_all();
@@ -95,20 +95,11 @@ void HealthChecker::stop() {
     }
 }
 
-std::uint64_t HealthChecker::completed_sweeps() const {
-    const std::lock_guard<std::mutex> guard(mutex_);
-    return sweeps_;
-}
-
 void HealthChecker::run() {
     while (true) {
         sweep();
-        {
-            const std::lock_guard<std::mutex> guard(mutex_);
-            ++sweeps_;
-        }
 
-        // Interruptible wait, so stop() does not have to outlast the interval.
+        // Interruptible wait, so stop() need not outlast the interval.
         std::unique_lock<std::mutex> lock(mutex_);
         if (wake_.wait_for(lock, interval_, [this] { return stopping_; })) {
             return;
@@ -117,10 +108,9 @@ void HealthChecker::run() {
 }
 
 void HealthChecker::sweep() {
-    // Probed in parallel so one slow or dead instance cannot hold up the rest of
-    // the sweep. The threads are transient and bounded by the instance count,
-    // which is small. Each probe records its own result immediately, so a slow
-    // instance does not delay anyone else's state update.
+    // Probed in parallel so one slow instance cannot hold up the sweep. Threads
+    // are transient and bounded by the instance count. Each probe records its
+    // own result immediately, so a slow instance delays nobody else's update.
     struct Transition {
         const std::string* service;
         const BackendEndpoint* instance;
@@ -147,8 +137,7 @@ void HealthChecker::sweep() {
         probe_thread.join();
     }
 
-    // Logged and counted here rather than in the probes, so only this thread
-    // writes to cerr and the registry sees one update per transition.
+    // Logged here rather than in the probes, so only this thread writes to cerr.
     for (const Transition& transition : transitions) {
         if (metrics_ != nullptr) {
             const std::vector<std::string_view> labels{*transition.service};

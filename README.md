@@ -1,20 +1,24 @@
 # api-gateway
 
-A C++20 HTTP API gateway, built up in stages.
+A C++20 reverse-proxy API gateway built on cpp-httplib.
 
-**Current stage: 9 — observability and metrics.**
+```
+client ──► middleware pipeline ──► router ──► rate limiter ──► load balancer
+              (request id, metrics, access log)                     │
+                                                                    ▼
+           backend ◄── reverse proxy ◄── retry budget ◄── circuit breaker
+                                                     ▲
+                                          health checker (background)
+```
 
-The gateway starts an HTTP listener, answers `GET /health` itself, and resolves
-every other request against a route table that maps a method and path prefix to
-a logical service name. A service may have several backend instances, which are
-probed in the background; one of the currently healthy ones is picked
-round-robin and the request is forwarded to it, with the backend's response
-returned to the client. A transient failure on a safe method is retried once
-onto another instance, and an instance that keeps failing has its circuit opened
-so it stops receiving traffic until it recovers. Clients can be rate limited
-per IP, locally or through Redis shared across gateway instances. Every request
-runs through a small middleware pipeline that gives it a correlation id and logs
-its outcome, and the gateway exposes Prometheus metrics on `/metrics`.
+A request is given a correlation id, routed to a logical service by method and
+path prefix, optionally rate limited per client, then forwarded to one of that
+service's healthy backend instances chosen round-robin. Transient failures on
+safe methods are retried onto another instance within a bounded budget; an
+instance that keeps failing has its circuit opened until it recovers. Backends
+are health-checked in the background, rate-limit state can be shared across
+gateway processes through Redis, and Prometheus metrics are served on
+`/metrics`.
 
 ## Requirements
 
@@ -495,7 +499,7 @@ gateway: backend users 127.0.0.1:9002 is unhealthy
 gateway: backend users 127.0.0.1:9002 is healthy
 ```
 
-**Limitations at this stage.** Health state is only as fresh as the last sweep,
+**Limitations.** Health state is only as fresh as the last sweep,
 so an instance that dies between probes is still selected; a retry can recover
 that request when the method is safe and another instance is eligible. A proxy
 failure does not change health state — it feeds the circuit breaker instead.
@@ -561,22 +565,20 @@ timeout is a `504`.
 ## Layout
 
 ```
-CMakeLists.txt          Top-level build definition
+CMakeLists.txt            Top-level build
 cmake/Dependencies.cmake  Pinned third-party dependencies (FetchContent)
-config/gateway.env      Sourceable defaults
-include/gateway/        Public headers
-src/                    Implementation; main.cpp is the entry point only
-tests/                  GoogleTest suite
+config/gateway.env        Sourceable defaults
+include/gateway/          Public headers
+src/                      Implementation; main.cpp is the entry point only
+tests/                    GoogleTest suite
+bench/                    Benchmark tooling and results (not built into the gateway)
 ```
 
-`src/circuit_breaker.cpp`, `src/config.cpp`, `src/health.cpp`,
-`src/load_balancer.cpp`, `src/metrics.cpp`, `src/middleware.cpp`,
-`src/proxy.cpp`, `src/rate_limiter.cpp`, `src/redis_rate_limiter.cpp`,
-`src/router.cpp` and `src/server.cpp` build into the `api_gateway_core` library, which both the
-executable and the tests link against — the tests therefore run the same server
-code that ships.
+Everything in `src/` except `main.cpp` builds into the `api_gateway_core`
+library, which both the executable and the tests link against, so the tests run
+the code that ships.
 
-Responsibilities are split so each answers one question:
+Responsibilities are split so each component answers one question:
 
 - `Router` — which logical service does this request belong to? Knows nothing
   about cpp-httplib, so it is unit tested without opening a socket.
@@ -601,16 +603,16 @@ Responsibilities are split so each answers one question:
   health checker's lifetime (started on construction, stopped and joined by
   `stop()` and by the destructor).
 
-The proxy tests start a real backend server in-process and assert on what it
+Integration tests start a real backend in-process and assert on what it
 received, so they exercise the whole client → gateway → backend → client path.
 
 ## Dependencies
 
-Both are fetched at configure time by CMake `FetchContent` and pinned to exact
-tags, so builds are reproducible without a system-wide install.
+Fetched at configure time by CMake `FetchContent` and pinned to exact tags, so
+builds are reproducible without a system-wide install.
 
 - [cpp-httplib](https://github.com/yhirose/cpp-httplib) `v0.18.7` — header-only
-  HTTP server (and the client used by the tests).
+  HTTP server and client.
 - [hiredis](https://github.com/redis/hiredis) `v1.4.1` — minimal C client for
   Redis. Chosen over a heavier C++ wrapper because the gateway only needs
   `EVALSHA`/`EVAL`.

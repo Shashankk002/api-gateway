@@ -24,9 +24,7 @@ using gateway::CircuitState;
 using gateway::Route;
 using gateway::Router;
 
-bool contains(const std::string& haystack, const std::string& needle) {
-    return haystack.find(needle) != std::string::npos;
-}
+using gateway_test::contains;
 
 Router users_router() {
     Router router;
@@ -244,10 +242,7 @@ protected:
     }
 
     gateway_test::TestBackend live_{"live"};
-    const gateway::BackendEndpoint dead_endpoint_ = [] {
-        const gateway_test::TestBackend probe;  // frees its port when destroyed
-        return probe.endpoint();
-    }();
+    const gateway::BackendEndpoint dead_endpoint_ = gateway_test::closed_endpoint();
 };
 
 TEST_F(DeadInstanceTest, RefusedConnectionIsRetriedOntoTheLiveInstance) {
@@ -310,10 +305,7 @@ protected:
     }
 
     gateway_test::TestBackend live_{"live"};
-    static gateway::BackendEndpoint closed_port() {
-        const gateway_test::TestBackend probe;
-        return probe.endpoint();
-    }
+    static gateway::BackendEndpoint closed_port() { return gateway_test::closed_endpoint(); }
     const gateway::BackendEndpoint dead_a_ = closed_port();
     const gateway::BackendEndpoint dead_b_ = closed_port();
     const gateway::BackendEndpoint dead_c_ = closed_port();
@@ -541,10 +533,7 @@ protected:
     }
 
     gateway_test::TestBackend live_{"live"};
-    const gateway::BackendEndpoint dead_endpoint_ = [] {
-        const gateway_test::TestBackend probe;
-        return probe.endpoint();
-    }();
+    const gateway::BackendEndpoint dead_endpoint_ = gateway_test::closed_endpoint();
 };
 
 TEST_F(RateLimitInteractionTest, RetriesCostOneRateLimitDecisionNotOnePerAttempt) {
@@ -611,10 +600,7 @@ protected:
         return config;
     }
 
-    static gateway::BackendEndpoint closed_port() {
-        const gateway_test::TestBackend probe;
-        return probe.endpoint();
-    }
+    static gateway::BackendEndpoint closed_port() { return gateway_test::closed_endpoint(); }
     const gateway::BackendEndpoint dead_a_ = closed_port();
     const gateway::BackendEndpoint dead_b_ = closed_port();
     const gateway::BackendEndpoint dead_c_ = closed_port();

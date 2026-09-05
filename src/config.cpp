@@ -162,7 +162,8 @@ std::pair<std::string, BackendEndpoint> parse_backend(std::string_view text,
             parse_endpoint(text.substr(equals + 1), source)};
 }
 
-std::string_view require_value(int argc, const char* const* argv, int index, std::string_view flag) {
+std::string_view require_value(int argc, const char* const* argv, int index,
+                               std::string_view flag) {
     if (index >= argc) {
         throw std::invalid_argument(std::string(flag) + " requires a value");
     }
@@ -251,8 +252,9 @@ ServerConfig load_config(int argc, const char* const* argv) {
         config.redis_failure_policy = parse_failure_policy(policy, "GATEWAY_REDIS_FAILURE_POLICY");
     }
     if (const char* cooldown = non_empty_env("GATEWAY_CIRCUIT_COOLDOWN_MS")) {
-        config.circuit_cooldown = std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(
-            parse_bounded(cooldown, "GATEWAY_CIRCUIT_COOLDOWN_MS", 0, kMaxCooldownMs)));
+        config.circuit_cooldown =
+            std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(
+                parse_bounded(cooldown, "GATEWAY_CIRCUIT_COOLDOWN_MS", 0, kMaxCooldownMs)));
     }
     if (const char* backends = non_empty_env("GATEWAY_BACKENDS")) {
         std::string_view remaining = backends;

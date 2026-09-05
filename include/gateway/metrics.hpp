@@ -15,7 +15,6 @@
 
 namespace gateway {
 
-/// Monotonically increasing count.
 class Counter {
 public:
     void increment(std::uint64_t amount = 1) noexcept {
@@ -29,7 +28,6 @@ private:
     std::atomic<std::uint64_t> value_{0};
 };
 
-/// Value that moves up and down, such as work currently in progress.
 class Gauge {
 public:
     void increment() noexcept { value_.fetch_add(1, std::memory_order_relaxed); }
@@ -42,10 +40,8 @@ private:
     std::atomic<std::int64_t> value_{0};
 };
 
-/// Fixed-bucket latency histogram in seconds.
-///
-/// Only bucket counts, an observation count and a sum are kept, so memory is
-/// constant no matter how many requests are observed.
+/// Latency histogram in seconds. Keeps only bucket counts, a count and a sum,
+/// so memory is constant however many requests are observed.
 class Histogram {
 public:
     /// Prometheus-style upper bounds suited to an HTTP gateway.
@@ -56,8 +52,7 @@ public:
     void observe(double seconds) noexcept;
 
     [[nodiscard]] const std::vector<double>& bounds() const noexcept { return bounds_; }
-    /// Counts for each bound, cumulative as Prometheus expects. The final entry
-    /// is the +Inf bucket and equals count().
+    /// Cumulative, as Prometheus expects.
     [[nodiscard]] std::vector<std::uint64_t> cumulative_counts() const;
     [[nodiscard]] std::uint64_t count() const noexcept {
         return count_.load(std::memory_order_relaxed);
@@ -71,12 +66,10 @@ private:
     std::atomic<double> sum_{0.0};
 };
 
-/// A counter family sharing a fixed set of label names.
-///
-/// Label values come from the gateway itself or from configuration, never from
-/// client input. The series cap is a backstop so that even a mistake upstream
-/// cannot grow this without bound; overflow is folded into a single "other"
-/// series rather than dropped silently.
+/// A counter family sharing a fixed set of label names. Label values come from
+/// the gateway or from configuration, never from client input; the series cap is
+/// a backstop against unbounded cardinality, folding overflow into one "other"
+/// series rather than dropping it.
 class LabeledCounter {
 public:
     static constexpr std::size_t kMaxSeries = 128;
@@ -108,24 +101,24 @@ private:
     std::map<std::string, std::unique_ptr<Series>> series_;
 };
 
-/// Every metric the gateway keeps. One instance per server; all members are
-/// safe to use from concurrent request threads.
+/// Every metric the gateway keeps. One instance per server, safe to use from
+/// concurrent request threads.
 ///
-/// Label policy: only bounded, low-cardinality dimensions. `method` is an
-/// allowlist, `status` is produced by the gateway or by a configured backend,
-/// and `service` comes from the configured backend table. Request ids, client
-/// addresses, paths, query strings and headers are never used as labels.
+/// Labels are bounded and low-cardinality only: `method` is an allowlist,
+/// `status` comes from the gateway or a configured backend, `service` from the
+/// configured backend table. Request ids, client addresses, paths, query
+/// strings and headers are never labels.
 class MetricsRegistry {
 public:
-    /// Pre-creates the per-service series so a scrape shows them at zero.
+    /// Pre-creates per-service series so a scrape shows them at zero.
     explicit MetricsRegistry(const BackendTable& backends);
 
-    /// Maps a method onto the allowlist, folding anything else into "other".
+    /// Folds anything outside the allowlist into "other".
     [[nodiscard]] static std::string_view normalize_method(std::string_view method);
 
     void observe_request(std::string_view method, int status, double seconds);
 
-    /// Prometheus text exposition, format version 0.0.4.
+    /// Prometheus text exposition, format 0.0.4.
     [[nodiscard]] std::string render() const;
     static constexpr const char* kContentType = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -149,12 +142,10 @@ public:
     LabeledCounter health_recoveries;  ///< gateway_backend_health_recoveries_total{service}
 };
 
-/// Records one client request: in-flight gauge, latency and the {method,status}
-/// counter.
-///
-/// The gauge is held by an RAII guard, so an early return or an exception can
-/// never leave it elevated. Requests for the metrics endpoint itself are not
-/// counted, so scraping does not move the numbers being scraped.
+/// Records in-flight, latency and the {method,status} counter. The gauge is
+/// held by an RAII guard, so an early return or exception cannot leave it
+/// elevated. The metrics endpoint itself is excluded, so scraping does not move
+/// the numbers being scraped.
 class MetricsMiddleware final : public Middleware {
 public:
     MetricsMiddleware(MetricsRegistry& metrics, std::string excluded_path);

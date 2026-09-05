@@ -17,11 +17,9 @@ class Response;
 
 namespace gateway {
 
-/// Per-request state shared between middleware and the terminal handler.
-///
-/// Built fresh for every request and never touched by another thread, so it
-/// needs no synchronisation. Holds references rather than copies: the request
-/// body is never duplicated.
+/// Per-request state shared between middleware and the terminal handler. Built
+/// fresh per request and never touched by another thread, so it needs no
+/// synchronisation. Holds references, so the request body is never copied.
 struct RequestContext {
     RequestContext(const httplib::Request& http_request, httplib::Response& http_response)
         : request(http_request), response(http_response) {}
@@ -32,27 +30,22 @@ struct RequestContext {
     const httplib::Request& request;
     httplib::Response& response;
 
-    /// Correlation id for this request. Assigned by RequestIdMiddleware.
-    std::string request_id;
+    std::string request_id;  ///< Assigned by RequestIdMiddleware.
 
-    /// Who the request is attributed to for rate limiting, as the gateway
-    /// determined it. Never taken from a client-supplied header.
+    /// Rate-limit identity, as the gateway determined it. Never from a header.
     std::string client_key;
 };
 
-/// The terminal step of a pipeline: everything the gateway does for a request
-/// once cross-cutting concerns have had their turn.
+/// The pipeline's terminal step: what the gateway does once the cross-cutting
+/// concerns have had their turn.
 using Handler = std::function<void(RequestContext&)>;
 
-/// The remainder of the pipeline, from one middleware's point of view.
+/// The rest of the pipeline, from one middleware's point of view.
 using Next = std::function<void()>;
 
-/// One cross-cutting concern.
-///
-/// A middleware runs before `next`, may skip calling it to end the request
-/// early, and may inspect or adjust the response after it returns. Instances
-/// are shared by concurrent requests, so any state they hold must be either
-/// immutable or synchronised.
+/// Runs before `next`, may skip calling it to end the request early, and may
+/// adjust the response afterwards. Instances are shared by concurrent requests,
+/// so any state they hold must be immutable or synchronised.
 class Middleware {
 public:
     Middleware() = default;
@@ -63,16 +56,13 @@ public:
     virtual void handle(RequestContext& context, const Next& next) = 0;
 };
 
-/// Composes middleware around a terminal handler, outermost first.
-///
-/// The pipeline itself is immutable once built: it stores no per-request state,
-/// so one instance serves every concurrent request.
+/// Composes middleware around a terminal handler, outermost first. Stores no
+/// per-request state, so one instance serves every concurrent request.
 class Pipeline {
 public:
-    /// Adds a middleware. Later additions run further in.
+    /// Later additions run further in.
     void use(std::unique_ptr<Middleware> middleware);
 
-    /// Runs the chain for one request, ending in `terminal`.
     void run(RequestContext& context, const Handler& terminal) const;
 
     [[nodiscard]] std::size_t size() const noexcept { return middleware_.size(); }
@@ -83,23 +73,21 @@ private:
 
 /// Gives every request a correlation id and returns it to the client.
 ///
-/// The id is always generated here. An inbound X-Request-Id is ignored: without
-/// trusted-proxy configuration it is client-supplied, and the gateway already
-/// declines to trust such headers for the rate-limit key. The id is for
-/// correlation only and carries no authority.
+/// An inbound X-Request-Id is ignored: without trusted-proxy configuration it is
+/// client-supplied, matching the gateway's stance on the rate-limit key. The id
+/// is for correlation only and carries no authority.
 class RequestIdMiddleware final : public Middleware {
 public:
     static constexpr const char* kHeader = "X-Request-Id";
 
     void handle(RequestContext& context, const Next& next) override;
 
-    /// A fresh 128-bit id as 32 lowercase hex characters. Thread-safe: each
-    /// thread draws from its own generator.
+    /// 128 bits as 32 lowercase hex. Each thread draws from its own generator.
     [[nodiscard]] static std::string generate();
 };
 
-/// Where request log lines go. Kept to one method so tests can capture output
-/// without the logging implementation growing a framework.
+/// Kept to one method so tests can capture output without the logging
+/// implementation growing a framework.
 class LogSink {
 public:
     LogSink() = default;
@@ -110,17 +98,14 @@ public:
     virtual void write(std::string_view line) = 0;
 };
 
-/// Writes to std::cerr, the channel the gateway already logs on.
 class StderrLogSink final : public LogSink {
 public:
     void write(std::string_view line) override;
 };
 
-/// Records one line per request: id, method, target, final status, duration.
-///
-/// Only the request line is logged. Headers and bodies are never touched, so
-/// credentials cannot leak through it, and the target is truncated so one
-/// enormous URL cannot dominate the log.
+/// One line per request: id, method, target, final status, duration. Headers
+/// and bodies are never read, so credentials cannot leak through it, and the
+/// target is truncated so one enormous URL cannot dominate the log.
 class LoggingMiddleware final : public Middleware {
 public:
     static constexpr std::size_t kMaxLoggedTarget = 256;
@@ -133,7 +118,7 @@ private:
     std::shared_ptr<LogSink> sink_;
 };
 
-/// A sink that keeps lines in memory, for tests.
+/// Keeps lines in memory, for tests.
 class CapturingLogSink final : public LogSink {
 public:
     void write(std::string_view line) override;

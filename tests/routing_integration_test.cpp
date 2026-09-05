@@ -14,9 +14,7 @@ namespace {
 using gateway::Route;
 using gateway::Router;
 
-bool contains(const std::string& haystack, const std::string& needle) {
-    return haystack.find(needle) != std::string::npos;
-}
+using gateway_test::contains;
 
 // A table chosen to exercise prefix boundaries, longest-prefix selection and
 // method handling over real HTTP. Each service has its own backend, so the

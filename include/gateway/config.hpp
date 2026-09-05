@@ -9,7 +9,6 @@
 
 namespace gateway {
 
-/// One instance of a logical service.
 struct BackendEndpoint {
     std::string host;
     std::uint16_t port{0};
@@ -17,29 +16,22 @@ struct BackendEndpoint {
     friend bool operator==(const BackendEndpoint&, const BackendEndpoint&) = default;
 };
 
-/// Which local algorithm backs rate limiting.
 enum class RateLimitAlgorithm { kTokenBucket, kSlidingWindow };
-
-/// Where rate-limit state lives: this process only, or shared through Redis.
 enum class RateLimitMode { kLocal, kRedis };
 
 /// What to do when Redis cannot be reached for a decision.
 enum class RedisFailurePolicy {
-    kFailOpen,    ///< Allow the request; availability over protection.
-    kFailClosed,  ///< Reject the request; protection over availability.
+    kFailOpen,    ///< Availability over protection.
+    kFailClosed,  ///< Protection over availability.
 };
 
-/// Logical service name -> its backend instances, in configured order.
-/// std::less<> allows string_view lookups.
+/// Service name -> instances, in configured order. std::less<> allows
+/// string_view lookups.
 using BackendTable = std::map<std::string, std::vector<BackendEndpoint>, std::less<>>;
 
-/// The gateway's built-in backend table, matching default_service_router().
+/// Built-in backend table, matching default_service_router().
 [[nodiscard]] BackendTable default_backends();
 
-/// Settings that control how the gateway's HTTP listener is started.
-///
-/// Kept as a plain value type so that later stages can grow it (or load it
-/// from a file) without touching the server implementation.
 struct ServerConfig {
     static constexpr std::uint16_t kDefaultPort = 8080;
     static constexpr const char* kDefaultHost = "0.0.0.0";
@@ -58,37 +50,28 @@ struct ServerConfig {
     std::uint16_t port{kDefaultPort};
 
     /// The only destinations the gateway will proxy to. Never derived from a
-    /// request, so the gateway cannot be used as an open proxy. A service may
-    /// list several instances; requests are spread across them round-robin.
+    /// request, so the gateway cannot be used as an open proxy.
     BackendTable backends{default_backends()};
 
-    /// Connect, read and write timeout for outbound backend requests, health
-    /// probes included.
+    /// Connect, read and write timeout for outbound requests, health probes
+    /// included.
     std::chrono::milliseconds backend_timeout{kDefaultBackendTimeout};
 
-    /// How often each backend instance is probed with GET /health. Zero turns
-    /// health checking off, leaving every configured instance eligible.
+    /// Zero disables health checking, leaving every instance eligible.
     std::chrono::milliseconds health_check_interval{kDefaultHealthCheckInterval};
 
-    /// Extra attempts allowed after a transient failure, on top of the first
-    /// one. Only safe methods are retried, and never onto an instance this
-    /// request has already tried. Zero disables retries.
+    /// Extra attempts after a transient failure. Zero disables retries.
     unsigned max_retries{kDefaultMaxRetries};
 
-    /// Consecutive transient failures that open a backend instance's circuit.
     unsigned circuit_failure_threshold{kDefaultCircuitFailureThreshold};
-
-    /// How long an open circuit refuses traffic before admitting one probe.
     std::chrono::milliseconds circuit_cooldown{kDefaultCircuitCooldown};
 
-    /// Off by default: enabling throttling is an explicit decision, and leaving
-    /// it off keeps the gateway's behaviour unchanged until it is asked for.
+    /// Off by default: throttling is an explicit decision.
     bool rate_limit_enabled{false};
     RateLimitAlgorithm rate_limit_algorithm{RateLimitAlgorithm::kTokenBucket};
 
-    /// "rate_limit_requests per rate_limit_window". The token bucket reads this
-    /// as a capacity of that many with a refill of the same amount per window;
-    /// the sliding window reads it as a ceiling over the trailing window.
+    /// "requests per window". The token bucket reads it as a capacity refilled
+    /// over the window; the sliding window as a ceiling over the trailing one.
     std::uint64_t rate_limit_requests{kDefaultRateLimitRequests};
     std::chrono::milliseconds rate_limit_window{kDefaultRateLimitWindow};
 
@@ -98,29 +81,16 @@ struct ServerConfig {
     std::string redis_key_prefix{kDefaultRedisKeyPrefix};
     RedisFailurePolicy redis_failure_policy{RedisFailurePolicy::kFailOpen};
 
-    /// Serve Prometheus metrics on /metrics. On by default: instrumentation is
-    /// cheap and an unobservable gateway is hard to operate.
     bool metrics_enabled{true};
 };
 
-/// Builds a ServerConfig from the process environment and command line.
+/// Precedence, lowest to highest: defaults, GATEWAY_* environment variables,
+/// then the matching command-line flags. The README lists both spellings.
 ///
-/// Precedence, lowest to highest: built-in defaults, environment variables
-/// (GATEWAY_HOST, GATEWAY_PORT, GATEWAY_BACKENDS, GATEWAY_BACKEND_TIMEOUT_MS,
-/// GATEWAY_HEALTH_CHECK_INTERVAL_MS, GATEWAY_MAX_RETRIES,
-/// GATEWAY_CIRCUIT_FAILURE_THRESHOLD, GATEWAY_CIRCUIT_COOLDOWN_MS), then the
-/// matching `--host`, `--port`, `--backend`, `--backend-timeout-ms`,
-/// `--health-check-interval-ms`, `--max-retries`,
-/// `--circuit-failure-threshold`, `--circuit-cooldown-ms`, `--rate-limit`,
-/// `--rate-limit-algorithm`, `--rate-limit-requests`, `--rate-limit-window-ms`,
-/// `--rate-limit-mode`, `--redis-host`, `--redis-port`, `--redis-key-prefix`
-/// `--redis-failure-policy` and `--metrics` arguments.
+/// The first backend given from any source replaces the built-in table; later
+/// ones append, so repeating a service name gives it several instances.
 ///
-/// The first backend given from any source replaces the built-in table; further
-/// ones add an instance, so repeating a service name gives it several
-/// instances.
-///
-/// Throws std::invalid_argument if a supplied value is missing or malformed.
+/// Throws std::invalid_argument if a value is missing or malformed.
 ServerConfig load_config(int argc, const char* const* argv);
 
 }  // namespace gateway

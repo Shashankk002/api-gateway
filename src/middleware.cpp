@@ -10,8 +10,7 @@
 namespace gateway {
 namespace {
 
-/// Status httplib will actually send: a handled route that set no status
-/// defaults to 200.
+// A handled route that set no status defaults to 200.
 int effective_status(const httplib::Response& response) {
     return response.status > 0 ? response.status : httplib::StatusCode::OK_200;
 }
@@ -32,8 +31,8 @@ void Pipeline::use(std::unique_ptr<Middleware> middleware) {
 }
 
 void Pipeline::run(RequestContext& context, const Handler& terminal) const {
-    // Walks the chain by index. Nothing is stored on the pipeline, so concurrent
-    // requests share only the immutable middleware list.
+    // Nothing is stored on the pipeline, so concurrent requests share only the
+    // immutable middleware list.
     const auto invoke = [this, &context, &terminal](auto& self, std::size_t index) -> void {
         if (index >= middleware_.size()) {
             terminal(context);
@@ -45,8 +44,8 @@ void Pipeline::run(RequestContext& context, const Handler& terminal) const {
 }
 
 std::string RequestIdMiddleware::generate() {
-    // Per-thread generator: no lock, and no two threads share a stream. The
-    // counter keeps seeds distinct even if random_device repeats.
+    // Per-thread generator: no lock, no shared stream. The counter keeps seeds
+    // distinct even if random_device repeats.
     static std::atomic<std::uint64_t> sequence{0};
     thread_local std::mt19937_64 engine([] {
         std::random_device device;
@@ -64,13 +63,13 @@ std::string RequestIdMiddleware::generate() {
 void RequestIdMiddleware::handle(RequestContext& context, const Next& next) {
     context.request_id = generate();
     next();
-    // Set afterwards: the proxy replaces the whole header map when it copies a
-    // backend response, so anything written before next() would be lost.
+    // After next(): the proxy replaces the whole header map when it copies a
+    // backend response, so an earlier write would be lost.
     context.response.set_header(kHeader, context.request_id);
 }
 
 void StderrLogSink::write(std::string_view line) {
-    // One insertion of one composed string, as the health checker does.
+    // One insertion of one composed string.
     std::cerr << std::string(line) + "\n";
 }
 
@@ -112,8 +111,7 @@ void LoggingMiddleware::handle(RequestContext& context, const Next& next) {
     try {
         next();
     } catch (...) {
-        // Record the outcome, then let httplib's exception handler produce the
-        // gateway's normal JSON 500.
+        // Record the outcome, then let httplib's handler produce the JSON 500.
         log(httplib::StatusCode::InternalServerError_500);
         throw;
     }

@@ -17,9 +17,7 @@ namespace {
 using gateway::Route;
 using gateway::Router;
 
-bool contains(const std::string& haystack, const std::string& needle) {
-    return haystack.find(needle) != std::string::npos;
-}
+using gateway_test::contains;
 
 class ProxyIntegrationTest : public gateway_test::GatewayServerTestBase {
 protected:
@@ -236,10 +234,7 @@ protected:
         return config;
     }
 
-    const gateway::BackendEndpoint closed_endpoint_ = [] {
-        const gateway_test::TestBackend probe;
-        return probe.endpoint();
-    }();
+    const gateway::BackendEndpoint closed_endpoint_ = gateway_test::closed_endpoint();
 };
 
 TEST_F(UnreachableBackendTest, ConnectionFailureReturns502) {

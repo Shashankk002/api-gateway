@@ -24,9 +24,7 @@ namespace {
 using gateway::Route;
 using gateway::Router;
 
-bool contains(const std::string& haystack, const std::string& needle) {
-    return haystack.find(needle) != std::string::npos;
-}
+using gateway_test::contains;
 
 Router users_router() {
     Router router;
@@ -140,10 +138,7 @@ protected:
     }
 
     gateway_test::TestBackend live_{"live"};
-    const gateway::BackendEndpoint dead_endpoint_ = [] {
-        const gateway_test::TestBackend probe;
-        return probe.endpoint();
-    }();
+    const gateway::BackendEndpoint dead_endpoint_ = gateway_test::closed_endpoint();
 };
 
 TEST_F(RequestIdUnderRetryTest, OneIdPerClientRequestEvenWhenItRetries) {
@@ -227,10 +222,7 @@ protected:
 
     gateway_test::TestBackend healthy_{"healthy"};
     gateway_test::TestBackend flaky_{"flaky"};
-    const gateway::BackendEndpoint dead_endpoint_ = [] {
-        const gateway_test::TestBackend probe;
-        return probe.endpoint();
-    }();
+    const gateway::BackendEndpoint dead_endpoint_ = gateway_test::closed_endpoint();
 };
 
 TEST_F(MixedStressTest, EveryRequestIsAnsweredAndAccountingStaysConsistent) {

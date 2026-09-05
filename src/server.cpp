@@ -11,12 +11,12 @@
 
 #include "gateway/circuit_breaker.hpp"
 #include "gateway/health.hpp"
+#include "gateway/load_balancer.hpp"
 #include "gateway/metrics.hpp"
 #include "gateway/middleware.hpp"
+#include "gateway/proxy.hpp"
 #include "gateway/rate_limiter.hpp"
 #include "gateway/redis_rate_limiter.hpp"
-#include "gateway/load_balancer.hpp"
-#include "gateway/proxy.hpp"
 #include "gateway/router.hpp"
 
 namespace gateway {
@@ -24,22 +24,19 @@ namespace {
 
 constexpr const char* kJsonContentType = "application/json";
 
-// Owned by the gateway itself: never offered to the Router, so no route table
-// can shadow or take over the health endpoint.
+// Gateway-owned, never offered to the Router, so no route table can shadow them.
 constexpr const char* kHealthPath = "/health";
 constexpr const char* kMetricsPath = "/metrics";
 
-// Matched by httplib as a regex, so it covers every path. Registered after the
+// httplib treats this as a regex, so it covers every path. Registered after the
 // gateway's own endpoints, which therefore win.
 constexpr const char* kCatchAllPattern = ".*";
 
-// These payloads are fixed, so they are stored as literals rather than
-// assembled at runtime. The gateway has no JSON dependency.
 constexpr const char* kHealthyBody = R"({"status":"healthy","service":"api-gateway"})";
 constexpr const char* kNotFoundBody = R"({"status":"error","error":"not_found"})";
 
-/// Appends `value` to `out` as a quoted JSON string. Routed responses echo the
-/// request path, which is attacker-controlled, so it must be escaped.
+// Escapes as a JSON string. Present values all originate in the gateway or its
+// configuration, but escaping keeps that from becoming a silent requirement.
 void append_json_string(std::string& out, std::string_view value) {
     static constexpr char kHexDigits[] = "0123456789abcdef";
 
@@ -66,7 +63,7 @@ void append_json_string(std::string& out, std::string_view value) {
     out += '"';
 }
 
-/// Reports an error the gateway itself produced while proxying.
+// An error the gateway produced itself, rather than a backend response.
 void respond_gateway_error(httplib::Response& response, int status, std::string_view error,
                            std::string_view reason, std::string_view service) {
     std::string body = R"({"status":"error","error":)";
@@ -94,18 +91,16 @@ std::string method_not_allowed_body(const std::vector<std::string_view>& allowed
     return body;
 }
 
-/// Retry policy, part one: only methods that are safe to repeat. A connection
-/// failure means the backend probably never saw the request, but the gateway
-/// cannot tell that apart from a failure after the backend acted, so unsafe
-/// methods are never replayed.
+// Only methods safe to repeat. A connection failure probably means the backend
+// never saw the request, but that is indistinguishable from a failure after it
+// acted, so unsafe methods are never replayed.
 bool is_retryable_method(std::string_view method) {
     return method == "GET" || method == "HEAD" || method == "OPTIONS";
 }
 
-/// Retry policy, part two: which outcomes are transient. The same predicate
-/// decides what counts as a circuit-breaker failure, so the two never disagree.
-/// A backend's own 4xx, or a 500 it chose to return, is an answer rather than a
-/// transport problem and is passed straight through.
+// Which outcomes are transient. The same predicate decides what counts as a
+// circuit-breaker failure, so the two cannot disagree. A backend's own 4xx, or
+// a 500 it chose to return, is an answer and passes straight through.
 bool is_transient_failure(ProxyStatus status, int backend_status) {
     if (status != ProxyStatus::kForwarded) {
         return true;  // Unreachable or timed out.
@@ -115,16 +110,14 @@ bool is_transient_failure(ProxyStatus status, int backend_status) {
            backend_status == httplib::StatusCode::GatewayTimeout_504;
 }
 
-/// Copies an accepted attempt onto the response the client will receive.
 void apply_attempt(const httplib::Response& attempt, httplib::Response& response) {
     response.status = attempt.status;
     response.headers = attempt.headers;
     response.body = attempt.body;
 }
 
-/// Builds the limiter the configuration asks for, or nothing when rate limiting
-/// is off. "requests per window" maps onto the token bucket as a capacity of
-/// that many refilled over the same window.
+// "requests per window" maps onto the token bucket as a capacity of that many
+// refilled over the same window.
 std::unique_ptr<RateLimiter> make_rate_limiter(const ServerConfig& config) {
     if (!config.rate_limit_enabled) {
         return nullptr;
@@ -144,14 +137,14 @@ std::unique_ptr<RateLimiter> make_rate_limiter(const ServerConfig& config) {
     return std::make_unique<TokenBucketLimiter>(config.rate_limit_requests, per_second);
 }
 
-/// Advertises the caller's standing. Applied to allowed responses too, after
-/// the proxy has written the backend's headers, so it is not overwritten.
+// Applied after the proxy has written the backend's headers, or it would be
+// overwritten.
 void apply_rate_limit_headers(httplib::Response& response, const RateLimitDecision& decision) {
     response.set_header("RateLimit-Limit", std::to_string(decision.limit));
     response.set_header("RateLimit-Remaining", std::to_string(decision.remaining));
 }
 
-/// RFC 9110 requires a 405 response to carry an Allow header.
+// RFC 9110 requires a 405 to carry an Allow header.
 std::string allow_header_value(const std::vector<std::string_view>& allowed_methods) {
     std::string value;
     for (const std::string_view method : allowed_methods) {
@@ -250,13 +243,13 @@ void GatewayServer::handle_service_request(RequestContext& context) const {
 }
 
 void GatewayServer::dispatch_to_service(const std::string& service,
-                                       const httplib::Request& request,
-                                       httplib::Response& response) const {
+                                        const httplib::Request& request,
+                                        httplib::Response& response) const {
     const std::size_t max_forwards =
         is_retryable_method(request.method) ? config_.max_retries + 1U : 1U;
 
-    // Every iteration marks one more instance as tried, so the loop ends once
-    // the service runs out of instances even if the retry budget does not.
+    // Every iteration marks one more instance tried, so the loop terminates on
+    // instance count even if the retry budget would not stop it.
     std::vector<std::size_t> tried;
     std::size_t forwards = 0;
     bool refused_by_circuit = false;
@@ -279,8 +272,7 @@ void GatewayServer::dispatch_to_service(const std::string& service,
 
         const std::vector<std::string_view> service_label{service};
         metrics_.backend_requests.increment(service_label);
-        if (forwards > 0) {
-            // Everything past the first attempt is a retry.
+        if (forwards > 0) {  // Everything past the first attempt is a retry.
             metrics_.retry_attempts.increment();
         }
 
@@ -321,8 +313,8 @@ void GatewayServer::dispatch_to_service(const std::string& service,
     }
 
     if (forwards == 0) {
-        // Nothing was contacted: either no instance is eligible at all, or the
-        // only candidates were circuits refusing traffic.
+        // Nothing was contacted: either nothing is eligible, or the only
+        // candidates were circuits refusing traffic.
         const auto circuit_is_blocking = [this, &service] {
             const BackendTable& table = balancer_.backends();
             const auto entry = table.find(service);
@@ -358,24 +350,23 @@ void GatewayServer::dispatch_to_service(const std::string& service,
                                   "backend_unreachable", service);
             return;
         case ProxyStatus::kForwarded:
-            // The backend answered, just with a transient status. Its own
-            // response is more informative than a gateway error would be.
+            // A transient status is still the backend's own answer, and more
+            // informative than a synthesised gateway error.
             apply_attempt(last_attempt, response);
             return;
     }
 }
 
 std::string GatewayServer::client_key(const httplib::Request& request) {
-    // The peer address the socket reports. X-Forwarded-For and friends are
-    // ignored: without trusted-proxy configuration they are client-supplied and
-    // would let anyone escape their own bucket.
+    // X-Forwarded-For and friends are ignored: without trusted-proxy
+    // configuration they are client-supplied and would let anyone escape their
+    // own bucket.
     return request.remote_addr.empty() ? std::string("unknown") : request.remote_addr;
 }
 
 void GatewayServer::register_routes() {
-    // /health stays gateway-owned and registered ahead of the catch-alls; it
-    // runs through the pipeline only for the cross-cutting concerns, never
-    // through routing, rate limiting or proxying.
+    // Registered ahead of the catch-alls, so httplib matches it first. Runs
+    // through the pipeline for the cross-cutting concerns only.
     http_->Get(kHealthPath, [this](const httplib::Request& request, httplib::Response& response) {
         run_pipeline(request, response, [](RequestContext& context) {
             context.response.set_content(kHealthyBody, kJsonContentType);
@@ -383,7 +374,6 @@ void GatewayServer::register_routes() {
     });
 
     if (config_.metrics_enabled) {
-        // Gateway-owned like /health: never routed, rate limited or proxied.
         http_->Get(kMetricsPath,
                    [this](const httplib::Request& request, httplib::Response& response) {
                        run_pipeline(request, response, [this](RequestContext& context) {
@@ -399,8 +389,8 @@ void GatewayServer::register_routes() {
         run_pipeline(request, response, [this](RequestContext& context) {
             if (context.request.path == kHealthPath ||
                 (config_.metrics_enabled && context.request.path == kMetricsPath)) {
-                // Gateway-owned. GET is served above; no other method is offered
-                // to the router, so these can never reach a backend.
+                // GET is served above; no other method is offered to the router,
+                // so these paths can never reach a backend.
                 context.response.status = httplib::StatusCode::NotFound_404;
                 context.response.set_content(kNotFoundBody, kJsonContentType);
                 return;
@@ -415,8 +405,8 @@ void GatewayServer::register_routes() {
     http_->Delete(kCatchAllPattern, handler);
     http_->Options(kCatchAllPattern, handler);
 
-    // Safety net for statuses httplib produces on its own. Proxied responses
-    // carry their backend's body and are left alone.
+    // Safety net for statuses httplib produces itself. A proxied response
+    // carries its backend's body and is left alone.
     http_->set_error_handler([](const httplib::Request&, httplib::Response& response) {
         if (response.status == httplib::StatusCode::NotFound_404 && response.body.empty()) {
             response.set_content(kNotFoundBody, kJsonContentType);
@@ -436,8 +426,7 @@ void GatewayServer::register_routes() {
 bool GatewayServer::bind(std::uint16_t port) {
     bound_port_ = 0;
 
-    // httplib exposes two entry points: one for a fixed port, one for an
-    // OS-assigned port that reports back which one it got.
+    // httplib has separate entry points for a fixed and an OS-assigned port.
     if (port == 0) {
         const int assigned = http_->bind_to_any_port(config_.host);
         if (assigned < 0) {

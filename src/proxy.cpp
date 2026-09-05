@@ -11,9 +11,8 @@
 namespace gateway {
 namespace {
 
-// Hop-by-hop headers (RFC 9110 7.6.1), plus headers httplib regenerates for the
-// outbound request: Host comes from the backend address, Content-Length from the
-// forwarded body.
+// Hop-by-hop (RFC 9110 7.6.1), plus headers httplib regenerates: Host from the
+// backend address, Content-Length from the forwarded body.
 constexpr std::string_view kSkippedRequestHeaders[] = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te",         "trailer",    "transfer-encoding",  "upgrade",
@@ -51,8 +50,8 @@ httplib::Headers forwardable(const httplib::Headers& headers,
     return result;
 }
 
-// httplib reports a read/write timeout as a plain transport error, so those are
-// treated as timeouts here; a refused connection is reported distinctly.
+// httplib reports a read/write timeout as a plain transport error, so those map
+// to a timeout here; a refused connection is reported distinctly.
 ProxyStatus classify(httplib::Error error) {
     switch (error) {
         case httplib::Error::ConnectionTimeout:

@@ -27,8 +27,8 @@ LoadBalancer::Selection LoadBalancer::select(std::string_view service,
     const std::vector<BackendEndpoint>& instances = entry->second;
     const std::span<const std::atomic<bool>> flags = health_.flags(service);
     const auto eligible = [&](std::size_t index) {
-        // A service missing from the health map is treated as unrestricted
-        // rather than dead; the two are built from the same table.
+        // A service missing from the health map counts as unrestricted rather
+        // than dead; both are built from the same table.
         const bool healthy = index >= flags.size() || flags[index].load(std::memory_order_relaxed);
         return healthy && !breakers_.blocks_selection(service, index) &&
                std::find(exclude.begin(), exclude.end(), index) == exclude.end();
@@ -42,12 +42,12 @@ LoadBalancer::Selection LoadBalancer::select(std::string_view service,
         return {};
     }
 
-    // relaxed: the counter only has to be unique per call, not ordered against
-    // other memory. Letting it wrap is harmless.
+    // relaxed: the ticket only has to be unique per call, not ordered against
+    // other memory. Wrapping is harmless.
     const auto position = positions_.find(service);
     const std::size_t ticket = position->second.fetch_add(1, std::memory_order_relaxed);
 
-    // Take the ticket-th eligible instance, so the rotation stays even across the
+    // The ticket-th eligible instance, so the rotation stays even across the
     // eligible subset instead of doubling up on whoever follows a skipped one.
     std::size_t remaining = ticket % eligible_count;
     Selection last_eligible;

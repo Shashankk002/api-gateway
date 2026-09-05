@@ -238,6 +238,18 @@ public:
     gateway::LoadBalancer balancer;
 };
 
+/// True when `haystack` contains `needle`.
+[[nodiscard]] inline bool contains(const std::string& haystack, const std::string& needle) {
+    return haystack.find(needle) != std::string::npos;
+}
+
+/// An endpoint whose port was bound and then released, so connecting to it is
+/// refused. Models a dead backend instance.
+[[nodiscard]] inline gateway::BackendEndpoint closed_endpoint() {
+    const TestBackend probe;
+    return probe.endpoint();
+}
+
 /// Runs a real gateway for the duration of a scope and shuts it down cleanly.
 /// Used where a test needs more than one gateway, or needs to control their
 /// lifetimes directly, rather than the single server GatewayServerTestBase runs.

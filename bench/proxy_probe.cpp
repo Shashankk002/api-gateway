@@ -1,11 +1,10 @@
-// Attribution probe for the outbound proxy path (Stage 11D).
+// Attribution probe for the outbound proxy path.
 //
-// Benchmark-only: it links the gateway library and calls the real
-// ReverseProxy::forward, then re-creates the same sequence step by step so the
-// phases can be timed individually. cpp-httplib performs resolve, connect,
-// send and receive inside one send() call, so those cannot be split from
-// outside; they are bounded here with independent syscall-level measurements
-// instead. Nothing here runs in the gateway.
+// Benchmark-only. Times the real ReverseProxy::forward, then re-creates the same
+// sequence step by step so phases can be timed individually, and compares it
+// against a minimal raw client. cpp-httplib performs resolve, connect, send and
+// receive inside one send() call, so those cannot be split from outside; they
+// are bounded with independent syscall measurements instead.
 
 #include <httplib.h>
 
@@ -66,12 +65,12 @@ void report(const char* label, const Stats& stats) {
                 stats.p50_us, stats.p99_us);
 }
 
-/// Minimal HTTP/1.1 client, benchmark-only. Just enough to send a GET and read
-/// the complete response, so it can be compared against cpp-httplib's client
-/// doing the same work. Not an HTTP implementation and never used in the gateway.
+/// Minimal HTTP/1.1 client, benchmark-only: enough to send a GET and read the
+/// complete response, so it can be compared against cpp-httplib doing the same
+/// work. Not an HTTP implementation, and never used by the gateway.
 class RawClient {
 public:
-    RawClient(const std::string& host, const std::string& port, const std::string& extra = "") {
+    RawClient(const std::string& host, const std::string& port) {
         addrinfo hints{};
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
@@ -79,7 +78,7 @@ public:
             resolved_ = nullptr;
         }
         wire_ = "GET /users/1 HTTP/1.1\r\nHost: " + host + ':' + port +
-                "\r\nAccept: */*\r\nUser-Agent: proxy-probe\r\n" + extra + "\r\n";
+                "\r\nAccept: */*\r\nUser-Agent: proxy-probe\r\n\r\n";
         buffer_.resize(16384);
     }
 
@@ -352,16 +351,6 @@ int main(int argc, char** argv) {
             report("raw client, reused connection", measure([&] { (void)raw.exchange(); }));
         }
     }
-    {
-        // The exact extra headers cpp-httplib adds, to test whether the request
-        // bytes rather than the client explain the gap.
-        RawClient raw(g_host, port_text, "Accept-Encoding: \r\nUser-Agent: cpp-httplib/0.18.7\r\n");
-        if (raw.connect()) {
-            report("raw client, httplib-shaped request headers", measure([&] {
-                       (void)raw.exchange();
-                   }));
-        }
-    }
     report("raw client, fresh connection per request", measure([&] {
                RawClient raw(g_host, port_text);
                if (raw.connect()) {
@@ -369,23 +358,5 @@ int main(int argc, char** argv) {
                }
            }));
 
-    // cpp-httplib defaults CPPHTTPLIB_TCP_NODELAY to false on both client and
-    // server, so Nagle is active. Measured here only to attribute time; the
-    // gateway is not changed.
-    std::printf("\n== Nagle attribution (client-side TCP_NODELAY) ==\n");
-    report("fresh client, TCP_NODELAY on", measure([&] {
-               httplib::Client client(g_host, g_port);
-               client.set_keep_alive(false);
-               client.set_tcp_nodelay(true);
-               (void)client.Get("/users/1");
-           }));
-    {
-        httplib::Client reused(g_host, g_port);
-        reused.set_keep_alive(true);
-        reused.set_tcp_nodelay(true);
-        report("reused client, keep-alive + TCP_NODELAY on", measure([&] {
-                   (void)reused.Get("/users/1");
-               }));
-    }
     return 0;
 }

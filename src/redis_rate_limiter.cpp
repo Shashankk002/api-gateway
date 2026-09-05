@@ -248,8 +248,10 @@ RateLimitDecision RedisRateLimiter::acquire(std::string_view key, Clock::time_po
     RateLimitDecision decision;
     decision.allowed = reply->element[0]->integer == 1;
     decision.limit = requests_;
-    decision.remaining = static_cast<std::uint64_t>(std::max<long long>(0, reply->element[1]->integer));
-    decision.retry_after = std::chrono::milliseconds{std::max<long long>(0, reply->element[2]->integer)};
+    decision.remaining =
+        static_cast<std::uint64_t>(std::max<long long>(0, reply->element[1]->integer));
+    decision.retry_after =
+        std::chrono::milliseconds{std::max<long long>(0, reply->element[2]->integer)};
     return decision;
 }
 
