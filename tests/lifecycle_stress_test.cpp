@@ -54,6 +54,30 @@ protected:
     }
 };
 
+TEST_F(LifecycleTest, ConcurrentStopCallsAreSafe) {
+    // stop() is documented thread-safe and idempotent, and the health checker's
+    // thread must be joined exactly once however many callers race for it.
+    gateway_test::TestBackend backend{"users"};
+    ScopedGateway gateway(config_for(backend), users_router());
+    ASSERT_TRUE(gateway.ok());
+
+    std::vector<std::thread> stoppers;
+    stoppers.reserve(8);
+    for (int i = 0; i < 8; ++i) {
+        stoppers.emplace_back([&gateway] {
+            for (int repeat = 0; repeat < 4; ++repeat) {
+                gateway.server().stop();
+            }
+        });
+    }
+    for (std::thread& stopper : stoppers) {
+        stopper.join();
+    }
+
+    auto client = gateway.client();
+    EXPECT_FALSE(client.Get("/users"));
+}
+
 TEST_F(LifecycleTest, RepeatedStartAndStopCyclesStayCleanAndIndependent) {
     gateway_test::TestBackend backend{"users"};
 

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 
 #include "gateway/circuit_breaker.hpp"
 #include "gateway/config.hpp"
@@ -110,6 +111,14 @@ private:
     HealthChecker checker_;
     std::unique_ptr<httplib::Server> http_;
     std::uint16_t bound_port_{0};
+
+    /// httplib::Server::stop() is neither safe against concurrent callers nor
+    /// safe to repeat while the accept loop is still unwinding: it asserts on
+    /// the socket it has already invalidated. These make the documented
+    /// thread-safe, idempotent contract above true. Reset by bind(), so a
+    /// stop() that arrived before serve() does not disarm the real one.
+    std::mutex stop_mutex_;
+    bool stop_called_{false};
 };
 
 }  // namespace gateway

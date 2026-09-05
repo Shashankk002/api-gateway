@@ -76,7 +76,14 @@ void respond_gateway_error(httplib::Response& response, int status, std::string_
 
     response.status = status;
     response.set_content(body, kJsonContentType);
-    std::cerr << "gateway: " << reason << " for service '" << service << "'\n";
+
+    // Unformatted, for the reason StderrLogSink::write explains.
+    std::string line = "gateway: ";
+    line.append(reason);
+    line += " for service '";
+    line.append(service);
+    line += "'\n";
+    std::cerr.write(line.data(), static_cast<std::streamsize>(line.size()));
 }
 
 std::string method_not_allowed_body(const std::vector<std::string_view>& allowed_methods) {
@@ -109,6 +116,39 @@ bool is_transient_failure(ProxyStatus status, int backend_status) {
            backend_status == httplib::StatusCode::ServiceUnavailable_503 ||
            backend_status == httplib::StatusCode::GatewayTimeout_504;
 }
+
+/// Pairs every admitted try_acquire() with exactly one outcome, including when
+/// an exception unwinds out of the attempt. A half-open breaker whose probe
+/// never reports back refuses every later probe, so the instance would stay
+/// unusable for the process's lifetime.
+class CircuitOutcome {
+public:
+    explicit CircuitOutcome(CircuitBreaker* breaker) noexcept : breaker_(breaker) {}
+    ~CircuitOutcome() {
+        if (breaker_ != nullptr) {
+            breaker_->record_failure();  // No usable response is a failed attempt.
+        }
+    }
+
+    CircuitOutcome(const CircuitOutcome&) = delete;
+    CircuitOutcome& operator=(const CircuitOutcome&) = delete;
+
+    /// True when this call is what opened the breaker.
+    bool settle(bool transient) {
+        CircuitBreaker* breaker = std::exchange(breaker_, nullptr);
+        if (breaker == nullptr) {
+            return false;
+        }
+        if (!transient) {
+            breaker->record_success();
+            return false;
+        }
+        return breaker->record_failure();
+    }
+
+private:
+    CircuitBreaker* breaker_;
+};
 
 void apply_attempt(const httplib::Response& attempt, httplib::Response& response) {
     response.status = attempt.status;
@@ -181,11 +221,20 @@ GatewayServer::GatewayServer(ServerConfig config, Router router,
     pipeline_.use(std::make_unique<LoggingMiddleware>(
         log_sink != nullptr ? std::move(log_sink) : std::make_shared<StderrLogSink>()));
 
+    if (config_.max_request_body_bytes > 0) {
+        http_->set_payload_max_length(static_cast<std::size_t>(config_.max_request_body_bytes));
+    }
+
     register_routes();
     checker_.start();
 }
 
-GatewayServer::~GatewayServer() = default;
+GatewayServer::~GatewayServer() {
+    // The accept loop is not stopped by ~Server, so without this a serve() still
+    // running on another thread would be left reading destroyed members. The
+    // caller must still join that thread.
+    stop();
+}
 
 void GatewayServer::run_pipeline(const httplib::Request& request, httplib::Response& response,
                                  const Handler& terminal) const {
@@ -269,6 +318,7 @@ void GatewayServer::dispatch_to_service(const std::string& service,
             refused_by_circuit = true;
             continue;
         }
+        CircuitOutcome outcome(breaker);
 
         const std::vector<std::string_view> service_label{service};
         metrics_.backend_requests.increment(service_label);
@@ -290,14 +340,8 @@ void GatewayServer::dispatch_to_service(const std::string& service,
                 metrics_.backend_timeouts.increment(service_label);
             }
         }
-        if (breaker != nullptr) {
-            if (transient) {
-                if (breaker->record_failure()) {
-                    metrics_.circuit_opens.increment(service_label);
-                }
-            } else {
-                breaker->record_success();
-            }
+        if (outcome.settle(transient)) {
+            metrics_.circuit_opens.increment(service_label);
         }
 
         ++forwards;
@@ -415,8 +459,9 @@ void GatewayServer::register_routes() {
 
     http_->set_exception_handler(
         [](const httplib::Request& request, httplib::Response& response, std::exception_ptr) {
-            std::cerr << "gateway: unhandled exception while serving " << request.method << ' '
-                      << request.path << '\n';
+            const std::string line = "gateway: unhandled exception while serving " +
+                                     request.method + " " + request.path + "\n";
+            std::cerr.write(line.data(), static_cast<std::streamsize>(line.size()));
             response.status = httplib::StatusCode::InternalServerError_500;
             response.set_content(R"({"status":"error","error":"internal_error"})",
                                  kJsonContentType);
@@ -425,6 +470,10 @@ void GatewayServer::register_routes() {
 
 bool GatewayServer::bind(std::uint16_t port) {
     bound_port_ = 0;
+    {
+        const std::lock_guard<std::mutex> guard(stop_mutex_);
+        stop_called_ = false;
+    }
 
     // httplib has separate entry points for a fixed and an OS-assigned port.
     if (port == 0) {
@@ -466,6 +515,11 @@ bool GatewayServer::run() {
         }
     }
     std::cout << "gateway: backend timeout " << proxy_.timeout().count() << "ms\n";
+    if (config_.max_request_body_bytes > 0) {
+        std::cout << "gateway: max request body " << config_.max_request_body_bytes << " bytes\n";
+    } else {
+        std::cout << "gateway: request body size unlimited\n";
+    }
     std::cout << "gateway: max retries " << config_.max_retries << ", circuit opens after "
               << config_.circuit_failure_threshold << " failures for "
               << config_.circuit_cooldown.count() << "ms\n";
@@ -498,7 +552,11 @@ bool GatewayServer::wait_until_ready() {
 }
 
 void GatewayServer::stop() {
-    http_->stop();
+    const std::lock_guard<std::mutex> guard(stop_mutex_);
+    if (http_->is_running() && !stop_called_) {
+        stop_called_ = true;
+        http_->stop();
+    }
     checker_.stop();
 }
 

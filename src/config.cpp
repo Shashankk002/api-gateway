@@ -20,6 +20,7 @@ constexpr unsigned long kMaxFailureThreshold = 1000;
 constexpr unsigned long kMaxCooldownMs = 3600000;
 constexpr unsigned long kMaxRateLimitRequests = 1000000;
 constexpr unsigned long kMaxRateLimitWindowMs = 3600000;
+constexpr unsigned long kMaxRequestBodyBytesLimit = 1024UL * 1024UL * 1024UL;
 
 std::uint16_t parse_port(std::string_view text, std::string_view source) {
     unsigned long value = 0;
@@ -245,6 +246,10 @@ ServerConfig load_config(int argc, const char* const* argv) {
     if (const char* prefix = non_empty_env("GATEWAY_REDIS_KEY_PREFIX")) {
         config.redis_key_prefix = prefix;
     }
+    if (const char* body = non_empty_env("GATEWAY_MAX_REQUEST_BODY_BYTES")) {
+        config.max_request_body_bytes = parse_bounded(body, "GATEWAY_MAX_REQUEST_BODY_BYTES", 0,
+                                                      kMaxRequestBodyBytesLimit);
+    }
     if (const char* metrics = non_empty_env("GATEWAY_METRICS")) {
         config.metrics_enabled = parse_bool(metrics, "GATEWAY_METRICS");
     }
@@ -307,6 +312,9 @@ ServerConfig load_config(int argc, const char* const* argv) {
             config.redis_port = parse_port(require_value(argc, argv, ++i, arg), arg);
         } else if (arg == "--redis-key-prefix") {
             config.redis_key_prefix = require_value(argc, argv, ++i, arg);
+        } else if (arg == "--max-request-body-bytes") {
+            config.max_request_body_bytes = parse_bounded(require_value(argc, argv, ++i, arg), arg,
+                                                          0, kMaxRequestBodyBytesLimit);
         } else if (arg == "--metrics") {
             config.metrics_enabled = parse_bool(require_value(argc, argv, ++i, arg), arg);
         } else if (arg == "--redis-failure-policy") {

@@ -45,6 +45,7 @@ struct ServerConfig {
     static constexpr const char* kDefaultRedisHost = "127.0.0.1";
     static constexpr std::uint16_t kDefaultRedisPort = 6379;
     static constexpr const char* kDefaultRedisKeyPrefix = "gateway:ratelimit";
+    static constexpr std::uint64_t kDefaultMaxRequestBodyBytes = 8 * 1024 * 1024;
 
     std::string host{kDefaultHost};
     std::uint16_t port{kDefaultPort};
@@ -82,6 +83,12 @@ struct ServerConfig {
     RedisFailurePolicy redis_failure_policy{RedisFailurePolicy::kFailOpen};
 
     bool metrics_enabled{true};
+
+    /// Largest request body accepted before forwarding. The whole body is held
+    /// in memory to be replayed on a retry, so without a ceiling one client
+    /// could size the gateway's memory use. Over it the answer is 413 and no
+    /// backend is contacted. Zero removes the ceiling.
+    std::uint64_t max_request_body_bytes{kDefaultMaxRequestBodyBytes};
 };
 
 /// Precedence, lowest to highest: defaults, GATEWAY_* environment variables,

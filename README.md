@@ -414,6 +414,7 @@ environment variables, then command-line flags.
 | Redis prefix    | `gateway:ratelimit`  | `GATEWAY_REDIS_KEY_PREFIX`    | `--redis-key-prefix <text>`   |
 | Redis failure   | `open`               | `GATEWAY_REDIS_FAILURE_POLICY` | `--redis-failure-policy open\|closed` |
 | Metrics         | `on`                 | `GATEWAY_METRICS`             | `--metrics on\|off`            |
+| Max request body | `8388608` bytes     | `GATEWAY_MAX_REQUEST_BODY_BYTES` | `--max-request-body-bytes <0-1073741824>` |
 
 `--backend` may be repeated; `GATEWAY_BACKENDS` takes a comma-separated list of
 the same `service=host:port` form. A leading `http://` is accepted and ignored.
@@ -426,6 +427,11 @@ api-gateway --backend users=127.0.0.1:9001 --backend users=127.0.0.1:9002
 ```sh
 GATEWAY_BACKENDS=users=127.0.0.1:9001,users=127.0.0.1:9002 api-gateway
 ```
+
+The gateway buffers a whole request body before forwarding it, so that a retry
+can replay it. The body ceiling is what keeps one client from sizing the
+gateway's memory use; a request over it is answered `413` and no backend is
+contacted. `--max-request-body-bytes 0` removes the ceiling.
 
 The health-check interval accepts `0` to turn health checking off entirely,
 leaving every configured instance eligible; otherwise it is 1–3600000 ms.
@@ -724,6 +730,43 @@ Responsibilities are split so each component answers one question:
 
 Integration tests start a real backend in-process and assert on what it
 received, so they exercise the whole client → gateway → backend → client path.
+
+## Trust boundaries and limitations
+
+The gateway is a routing and reliability component, not an edge security
+device. What it does and does not trust is deliberate:
+
+- **No authentication or authorization.** Every request that matches a route is
+  proxied. Put an authenticating layer in front of it if you need one.
+- **`/metrics` is unauthenticated** and names the configured services along with
+  their request, failure and circuit counts. Bind the gateway to an internal
+  interface, or keep it off a public network, if that is sensitive.
+- **Client-supplied identity headers are ignored.** `X-Forwarded-For` does not
+  influence the rate-limit key, and an inbound `X-Request-Id` is replaced. Both
+  would otherwise let a caller choose its own identity, and there is no
+  trusted-proxy configuration to say when they could be believed.
+- **Backends are trusted.** Their status, body and headers pass through, minus
+  hop-by-hop headers. A backend can therefore set any response header the
+  gateway does not itself write.
+- **Redis is trusted and unauthenticated**, and holds only rate-limit counters.
+- **`Host` is regenerated** from the backend address, so backends cannot serve
+  virtual hosts keyed on the client's original `Host`.
+- **A backend's own `5xx` is an answer, not a failure.** Only an unreachable
+  backend, a timeout, or a `502`/`503`/`504` counts as transient and can trip a
+  circuit or be retried.
+
+Three limits come from cpp-httplib rather than from the gateway:
+
+- The request line is capped at 8 KiB and each header line at 8 KiB, but the
+  *number* of headers is not capped. In practice this is bounded by the 5-second
+  server read timeout and by the size of the connection thread pool, but a
+  per-connection header ceiling is not available to configure.
+- An `application/x-www-form-urlencoded` body over 8 KiB is rejected with `413`
+  by the library before the gateway sees it, whatever the configured body limit.
+- The request body is read only after a route has been matched, which is why the
+  gateway registers a catch-all per method rather than one pre-routing hook.
+
+`TRACE` is answered `400` by the library; the gateway does not route it.
 
 ## Dependencies
 

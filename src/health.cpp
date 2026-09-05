@@ -85,6 +85,7 @@ void HealthChecker::start() {
 }
 
 void HealthChecker::stop() {
+    const std::lock_guard<std::mutex> stopping(stop_mutex_);
     {
         const std::lock_guard<std::mutex> guard(mutex_);
         stopping_ = true;
@@ -147,10 +148,12 @@ void HealthChecker::sweep() {
                 metrics_->health_failures.increment(labels);
             }
         }
-        std::cerr << "gateway: backend " + *transition.service + " " +
-                         transition.instance->host + ":" +
-                         std::to_string(transition.instance->port) +
-                         (transition.healthy ? " is healthy\n" : " is unhealthy\n");
+        // Unformatted, for the reason StderrLogSink::write explains.
+        const std::string line = "gateway: backend " + *transition.service + " " +
+                                 transition.instance->host + ":" +
+                                 std::to_string(transition.instance->port) +
+                                 (transition.healthy ? " is healthy\n" : " is unhealthy\n");
+        std::cerr.write(line.data(), static_cast<std::streamsize>(line.size()));
     }
 }
 

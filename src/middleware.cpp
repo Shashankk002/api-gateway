@@ -69,8 +69,11 @@ void RequestIdMiddleware::handle(RequestContext& context, const Next& next) {
 }
 
 void StderrLogSink::write(std::string_view line) {
-    // One insertion of one composed string.
-    std::cerr << std::string(line) + "\n";
+    // Unformatted output of one composed string: operator<< would read and write
+    // the stream's shared width and fill state, which libc++ does not
+    // synchronise, so concurrent request threads would race on it.
+    const std::string text = std::string(line) + "\n";
+    std::cerr.write(text.data(), static_cast<std::streamsize>(text.size()));
 }
 
 LoggingMiddleware::LoggingMiddleware(std::shared_ptr<LogSink> sink) : sink_(std::move(sink)) {}

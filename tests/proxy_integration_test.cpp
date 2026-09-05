@@ -9,6 +9,7 @@
 #include <chrono>
 #include <string>
 
+#include "gateway/config.hpp"
 #include "gateway/router.hpp"
 #include "gateway_fixture.hpp"
 
@@ -133,6 +134,61 @@ TEST_F(ProxyIntegrationTest, HopByHopRequestHeadersAreNotForwarded) {
     EXPECT_FALSE(received.has_header("Proxy-Authorization"));
     // Host is regenerated for the backend rather than passed through.
     EXPECT_EQ(received.header("Host"), "127.0.0.1:" + std::to_string(backend_.port()));
+}
+
+TEST_F(ProxyIntegrationTest, HeadersNamedByConnectionAreNotForwarded) {
+    // RFC 9110 7.6.1: Connection names further headers that apply only to this
+    // hop, so which ones they are is decided per request, not by a fixed list.
+    auto client = make_client();
+    const httplib::Headers headers{
+        {"Connection", "keep-alive, X-Hop-Only"},
+        {"X-Hop-Only", "must not reach the backend"},
+        {"Proxy-Connection", "keep-alive"},
+        {"X-Application", "kept"},
+    };
+    ASSERT_TRUE(client.Get("/users", headers));
+
+    ASSERT_EQ(backend_.request_count(), 1U);
+    const auto received = backend_.received().front();
+    EXPECT_FALSE(received.has_header("X-Hop-Only"));
+    EXPECT_FALSE(received.has_header("Proxy-Connection"));
+    EXPECT_EQ(received.header("X-Application"), "kept");
+}
+
+TEST_F(ProxyIntegrationTest, HeadersNamedByTheBackendsConnectionAreNotReturned) {
+    backend_.set_response(200, R"({"from":"backend"})", "application/json",
+                          {{"Connection", "X-Backend-Hop"},
+                           {"X-Backend-Hop", "internal"},
+                           {"X-Backend-Application", "kept"}});
+    auto client = make_client();
+    const auto response = client.Get("/users");
+
+    ASSERT_TRUE(response);
+    EXPECT_FALSE(response->has_header("X-Backend-Hop"));
+    EXPECT_EQ(response->get_header_value("X-Backend-Application"), "kept");
+}
+
+TEST_F(ProxyIntegrationTest, RequestBodyOverTheLimitIsRejectedWithoutContactingABackend) {
+    // The gateway buffers the whole body so a retry can replay it, so the
+    // ceiling is what keeps one client from sizing its memory use.
+    auto client = make_client();
+    const std::string oversized(gateway::ServerConfig::kDefaultMaxRequestBodyBytes + 1024, 'x');
+    const auto response = client.Post("/users", oversized, "application/octet-stream");
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 413);
+    EXPECT_EQ(backend_.request_count(), 0U);
+}
+
+TEST_F(ProxyIntegrationTest, RequestBodyUnderTheLimitIsStillForwarded) {
+    auto client = make_client();
+    const std::string body(64 * 1024, 'y');
+    const auto response = client.Post("/users", body, "application/octet-stream");
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 200);
+    ASSERT_EQ(backend_.request_count(), 1U);
+    EXPECT_EQ(backend_.received().front().body, body);
 }
 
 TEST_F(ProxyIntegrationTest, BackendResponseStatusIsPreserved) {

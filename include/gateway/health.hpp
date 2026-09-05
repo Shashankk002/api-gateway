@@ -96,6 +96,11 @@ private:
     std::condition_variable wake_;
     bool stopping_{false};
     std::thread thread_;
+
+    /// Serialises stop() itself. The sweep thread waits on mutex_, so the join
+    /// cannot be guarded by that one, and two concurrent stops must not both
+    /// join the same thread.
+    std::mutex stop_mutex_;
 };
 
 }  // namespace gateway
