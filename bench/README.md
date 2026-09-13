@@ -98,7 +98,7 @@ Record per run: requests/sec, p50, p90, p99, connections, threads, build type.
 ## Environment
 
 Every number below was measured on: Apple Silicon, 8 cores, 8 GB RAM, macOS
-25.6, Release build with Apple Clang 21, wrk 4.2.0, loopback only. Client,
+26.6, Release build with Apple Clang 21, wrk 4.2.0, loopback only. Client,
 gateway and backend share the same 8 cores, so absolute figures understate what
 dedicated hosts would show. These are not targets.
 

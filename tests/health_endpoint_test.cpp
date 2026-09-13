@@ -55,8 +55,7 @@ TEST_F(GatewayServerTest, UnsupportedMethodOnHealthReturns404) {
 
 TEST_F(GatewayServerTest, NoUnexpectedGatewayRoutesAreExposed) {
     auto client = make_client();
-    // /metrics moved out of this list in Stage 9, where it became a deliberate
-    // gateway-owned endpoint; it is asserted separately below.
+    // /metrics is a deliberate gateway-owned endpoint and is asserted separately.
     for (const char* path : {"/", "/routes", "/admin"}) {
         const auto response = client.Get(path);
         ASSERT_TRUE(response) << "request to " << path << " failed";

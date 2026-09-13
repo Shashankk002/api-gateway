@@ -6,8 +6,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <initializer_list>
+#include <system_error>
 #include <utility>
 
 namespace gateway {
@@ -37,7 +37,7 @@ std::uint16_t parse_port(std::string_view text, std::string_view source) {
     return static_cast<std::uint16_t>(value);
 }
 
-/// Returns the value of `name`, or nullopt when it is unset or empty.
+/// Returns the value of `name`, or null when it is unset or empty.
 const char* non_empty_env(const char* name) {
     const char* value = std::getenv(name);
     return (value != nullptr && *value != '\0') ? value : nullptr;

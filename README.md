@@ -22,7 +22,8 @@ gateway processes through Redis, and Prometheus metrics are served on
 
 ## Requirements
 
-- A C++20 compiler (tested with Apple Clang 21)
+- A C++20 compiler (tested with Apple Clang 21 on macOS and GCC 12 in the
+  Debian 12 Docker build)
 - CMake 3.20 or newer
 - Git and network access on the first configure (dependencies are fetched then)
 
@@ -192,16 +193,12 @@ Request ID -> Metrics -> Logging -> gateway dispatch (routing, rate limiting,
 ```
 
 A middleware runs before `next`, may skip calling it to end the request early,
-and may inspect or adjust the response afterwards. Routing and the backend
-machinery deliberately stay inside the terminal step: they are the gateway's
-job, not cross-cutting concerns, and forcing them into generic middleware would
-buy nothing.
+and may adjust the response afterwards. Routing and the backend machinery stay
+in the terminal step; they are the gateway's job, not cross-cutting concerns.
 
-`RequestContext` is built per request and holds only what is shared across the
-chain — references to the request and response, the request id and the
-rate-limit client key. It holds no global state and is never touched by another
-thread, so it needs no synchronisation, and the request body is referenced
-rather than copied.
+`RequestContext` is built per request and holds references to the request and
+response, the request id and the rate-limit client key. It is never shared
+between threads, so it needs no synchronisation, and the body is not copied.
 
 `GET /health` runs through the pipeline too, so it gets an id and a log line,
 but it stays gateway-owned: it never reaches routing, rate limiting, circuit
@@ -563,9 +560,9 @@ append, so repeating a service name gives it more instances.
 A matched request is forwarded with its method, its original request target
 (path and query unchanged — there is no path rewriting), its body and its
 headers. Hop-by-hop headers (`Connection`, `Keep-Alive`, `Proxy-Authenticate`,
-`Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`) are
-dropped in both directions, and `Host` and `Content-Length` are regenerated for
-the backend. The backend's status, body and remaining headers are returned to
+`Proxy-Authorization`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`,
+`Upgrade`, plus any header the `Connection` header names) are dropped in both
+directions, and `Host` and `Content-Length` are regenerated for the backend. The backend's status, body and remaining headers are returned to
 the client as-is, so a backend `201` or `404` reaches the client as `201` or
 `404` rather than becoming a gateway error.
 
@@ -680,10 +677,6 @@ traffic, the gateway answers `503` with reason `circuit_open`.
 Circuit state and health state are independent. Health reflects what background
 probing observed; a circuit reflects how real requests have been failing.
 Neither resets the other.
-
-Outbound requests use a finite connect/read/write timeout, **5000 ms** by
-default (`--backend-timeout-ms`). A refused connection is a `502`; exceeding the
-timeout is a `504`.
 
 ## Layout
 
